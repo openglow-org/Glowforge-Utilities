@@ -122,7 +122,7 @@ pip install gfutilities
 Or install from source (for development, or to track `master`):
 
 ```bash
-git clone https://github.com/ScottW514/Glowforge-Utilities.git
+git clone https://github.com/openglow-org/Glowforge-Utilities.git
 cd Glowforge-Utilities
 
 # (recommended) create and activate a virtual environment
