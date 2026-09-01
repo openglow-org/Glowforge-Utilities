@@ -171,7 +171,7 @@ supported within a section.
 `serial` and `password` are derived from the i.MX6 OCOTP fuses on a real
 Glowforge (the serial from `HW_OCOTP_MAC0`, the password from `HW_OCOTP_SRK0..7`).
 
-You must have [serial](https://github.com/ScottW514/forgefirm/blob/master/SERIAL.md) access to your device.
+You must have [serial](https://docs.forgefirm.org/install/serial-access/) access to your device.
 
 Hostname is simple.  It's the identifier shown at the command prompt (use all caps).  
 
