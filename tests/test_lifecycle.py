@@ -426,3 +426,46 @@ def test_fetch_motion_limits_lift_at_zero(monkeypatch):
 
     assert info and source is not None
     assert source.body_size == len(data)
+
+
+def test_tx_pump_survives_a_socket_error():
+    """A raw OSError out of send (the peer reset before on_close fired) must
+    not end the pump: it is started once per client, and every frame after
+    it would be dropped for the life of the process."""
+    import threading
+    import time
+    c = ws.WsClient(Queue(), Queue())
+    sent = []
+
+    class Sock:
+        def __init__(self):
+            self.fail_once = True
+
+        def send(self, m):
+            if self.fail_once:
+                self.fail_once = False
+                raise ConnectionResetError(104, 'Connection reset by peer')
+            sent.append(m)
+
+        def close(self):
+            pass
+    c.ws = Sock()
+    c.ready = True
+    t = threading.Thread(target=c._tx_pump, daemon=True)
+    t.start()
+    c.msg_q_tx.put('first')
+    for _ in range(50):
+        if not c.ready:
+            break
+        time.sleep(0.02)
+    assert not c.ready                  # the socket is done
+    assert t.is_alive()                 # the pump is not
+    c.ready = True                      # the reconnect
+    c.msg_q_tx.put('second')
+    for _ in range(50):
+        if sent:
+            break
+        time.sleep(0.02)
+    c.stop = True
+    t.join(2)
+    assert sent == ['second']

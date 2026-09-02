@@ -180,8 +180,14 @@ class WsClient(Thread):
                 logger.info('TX-EVENT: ' + send_msg.strip())
                 try:
                     self.ws.send(send_msg)
-                except websocket.WebSocketException as e:
+                except Exception as e:
+                    # A socket-level error (the peer reset before on_close
+                    # fired) escapes send as an OSError, not a
+                    # WebSocketException. Nothing may end this thread: it
+                    # is the only sender for the life of the process. The
+                    # socket is done; the reconnect brings a new one.
                     logger.error('TX FAILED: %s' % e)
+                    self.ready = False
                 self.msg_q_tx.task_done()
             else:
                 time.sleep(0.1)
