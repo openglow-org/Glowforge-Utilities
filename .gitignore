@@ -127,5 +127,10 @@ dev/
 
 # The package test suite is tracked (the rule above is for scratch scripts).
 !tests/
-!tests/**
+!tests/*.py
 tests/__pycache__/
+
+# The test tree and the host-test workflow are part of the repository.
+!tests/
+!tests/*.py
+!.github/workflows/host-tests.yml

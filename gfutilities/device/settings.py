@@ -18,9 +18,8 @@ logger = logging.getLogger(LOGGER_NAME)
 
 MACHINE_SETTINGS = {
     # Settings that are communicated between the service and the device.
-    # Mostly just sent to the service from the machine, and it seems to make little difference.
-    # Default values are included for those that are not otherwise set (see further down).
-    # Throwing garbage values doesn't seem to hurt.  Not sure what the point of this exercise is...
+    # Mostly sent to the service from the machine. Default values are
+    # included for those that are not otherwise set (see further down).
     #
     # "ITEM": (<data type>, <report to service>, <min value>, <max value>, <default value>, <idle callable>,
     # <run callable>, <cool_down callable>)

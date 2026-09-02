@@ -19,21 +19,23 @@ def parse(cfg_file: str) -> None:
     :param cfg_file: path to configuration file
     :type cfg_file: str
     """
-    defaults = {
-        'log_level': 'DEBUG',
-        'console_log_level': 'False',
-    }
-    config = configparser.ConfigParser(defaults)
+    config = configparser.ConfigParser()
     config.read(cfg_file)
     for section in config.sections():
-        for item in config.items(section):
-            if item[1] == 'True':
+        for key in config.options(section):
+            # %(name)s refers to another key of the section; a value
+            # that merely contains a % (a password) is taken as it is.
+            try:
+                raw = config.get(section, key)
+            except configparser.InterpolationError:
+                raw = config.get(section, key, raw=True)
+            if raw == 'True':
                 value = True
-            elif item[1] == 'False':
+            elif raw == 'False':
                 value = False
             else:
-                value = item[1]
-            _CONFIG['%s.%s' % (str.upper(section), str.upper(item[0]))] = value
+                value = raw
+            _CONFIG['%s.%s' % (str.upper(section), str.upper(key))] = value
 
 
 def log_level(level_str: str) -> int:

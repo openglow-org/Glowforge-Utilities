@@ -7,8 +7,6 @@ SPDX-License-Identifier:    MIT
 """
 import logging
 from requests import Session
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from gfutilities._common import *
 from gfutilities.configuration import get_cfg, set_cfg
@@ -30,15 +28,6 @@ def authenticate_machine(s: Session) -> bool:
     :rtype: bool
     """
     logger.info('START')
-
-    retries = Retry(
-        total=30,
-        backoff_factor=5,
-        backoff_max=30,
-        allowed_methods=["GET"]
-    )
-    adapter = HTTPAdapter(max_retries=retries)
-    s.mount("https://", adapter)
 
     r = request(s, get_cfg('SERVICE.SERVER_URL') + '/machines/sign_in', 'POST',
                 _retry_auth=False,

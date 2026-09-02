@@ -12,6 +12,8 @@ from pathlib import Path
 from queue import Queue
 import requests
 from requests import Request, Response, Session
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from threading import Lock, Thread
 import time
 from typing import Any, Union
@@ -234,16 +236,6 @@ def record_factory_latest(version: str) -> None:
         logger.warning('could not record factory-latest version: %s' % e)
 
 
-def _byte_to_int(data: bytes) -> int:
-    """
-    Returns integer value of big endian byte data
-    :param data:
-    :return: Integer value
-    :rtype: int
-    """
-    return ord(data[0:1]) + (ord(data[1:2]) * 0x100) + (ord(data[2:3]) * 0x10000) + (ord(data[3:4]) * 0x1000000)
-
-
 def firmware_check(s: Session) -> Union[dict, bool]:
     """
     Query the factory firmware version the service currently advertises and
@@ -286,6 +278,11 @@ def get_session() -> Session:
     :rtype: Session
     """
     s = Session()
+    # One adapter for the session's life. GET retries are short: a
+    # pulse download on the action thread must give up in seconds, not
+    # minutes, so a cancel can reach the job it belongs to.
+    s.mount("https://", HTTPAdapter(max_retries=Retry(
+        total=4, backoff_factor=1, backoff_max=8, allowed_methods=["GET"])))
     set_cfg('SESSION.USER_AGENT', 'OpenGlow/%s' % get_cfg('FACTORY_FIRMWARE.FW_VERSION'))
     s.headers.update({'user-agent': get_cfg('SESSION.USER_AGENT')})
     logger.debug('Returning object : %s' % s)
@@ -622,7 +619,6 @@ def request(s: Session, url: str, method: str, timeout: int = 15, stream: bool =
 
 def send_wss_event(msg_q_tx: Queue, action_id: Union[int, None], event: str, **kwargs):
     global response_id
-    global start_time
     with _response_id_lock:      # called from several threads
         response_id += 1
         rid = response_id
@@ -659,7 +655,6 @@ def send_wss_progress(msg_q_tx: Queue, action_id: Union[int, None], progress: st
     perishable, and the next one is thirty seconds behind it.
     """
     global response_id
-    global start_time
     if msg_q_tx.qsize() >= TX_QUEUE_MAX:
         logger.warning('event TX queue full (socket down?); dropping %s' % progress)
         return

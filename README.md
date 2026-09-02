@@ -8,12 +8,12 @@ A collection of utilities to aid in firmware development for the
 [Glowforge](https://glowforge.com/) laser cutter. Its centerpiece is a **machine
 emulator** that authenticates to the Glowforge cloud service, speaks the
 real-time control protocol, and responds to the service the way a physical
-Glowforge does — useful for studying the protocol, exercising the cloud
+Glowforge does - useful for studying the protocol, exercising the cloud
 workflow, and as a foundation for alternative control software.
 
 ---
 
-> ## ⚠️ Disclaimer — please read
+> ## ⚠️ Disclaimer - please read
 >
 > This project is **not affiliated nor endorsed by Glowforge, Inc.**
 >
@@ -50,7 +50,8 @@ workflow, and as a foundation for alternative control software.
 
 - **Authenticates** a machine to the web service (`/machines/sign_in`) using its
   serial number and password, retrieving the session and WebSocket tokens.
-- **Checks for and downloads firmware** advertised by the service.
+- **Probes the factory firmware version** the service advertises. Nothing is
+  downloaded or installed; the probe feeds a compatibility banner.
 - Opens the **real-time WebSocket control channel** to the status service and
   reacts to the service's *action* messages.
 - **Emulates** a machine's responses: it reports the full machine **settings**
@@ -69,16 +70,16 @@ homing → motion → print cycle completes without any hardware attached.
 
 Two channels are used, mirroring the real device:
 
-1. **HTTPS (`requests`)** — sign-in, firmware download, image upload, and motion
-   (pulse) file download.
-2. **WebSocket (`websocket-client`)** — a persistent, auto-reconnecting control
+1. **HTTPS (`requests`)** - sign-in, the firmware version probe, image upload,
+   and motion (pulse) file download.
+2. **WebSocket (`websocket-client`)** - a persistent, auto-reconnecting control
    channel (subprotocol `glowforge`) carrying JSON *action* messages from the
    service and *event* messages from the machine.
 
 ```
                         ┌──────────────────────────────┐
    HTTPS  sign_in /     │     Glowforge cloud          │
-   update / images /    │  app.glowforge.com (HTTPS)   │
+   version / images /   │  app.glowforge.com (HTTPS)   │
    motion files         │  status.glowforge.com (WSS)  │
             ┌──────────▶└─────────────┬────────────────┘
             │                         │    WSS: action messages  ▲ events
@@ -145,8 +146,9 @@ cp gf-machine-emulator.cfg.sample gf-machine-emulator.cfg
 
 Configuration is parsed by [`gfutilities/configuration.py`](gfutilities/configuration.py):
 section/option names are upper-cased into flat `SECTION.OPTION` keys, the literal
-strings `True`/`False` become booleans, and `%(name)s` interpolation is
-supported within a section.
+strings `True`/`False` become booleans, and `%(name)s` refers to another key of
+the same section (a value that merely contains a `%`, such as a password, is
+taken as it is).
 
 | Section | Key | Purpose |
 |---|---|---|
@@ -154,8 +156,7 @@ supported within a section.
 | | `status_service_url` | WebSocket control URL (`wss://status.glowforge.com`). |
 | `[MACHINE]` | `serial`, `password` | **Credentials** the machine signs in with (see below). |
 | | `hostname`, `head_id`, `head_serial`, `head_firmware` | Optional identity overrides reported in the settings report. |
-| `[FACTORY_FIRMWARE]` | `check` | Whether to query/download advertised firmware. |
-| | `download_dir` | Where downloaded firmware is written. |
+| `[FACTORY_FIRMWARE]` | `check` | Whether to probe the advertised firmware version at connect. |
 | | `fw_version`, `app_version` | Optional reported-version overrides. |
 | `[EMULATOR]` | `base_dir` | Root for the emulator's resource folders. |
 | | `image_src_dir` | Canned camera images (`HOME_1..4.jpg`, `HEAD_*.jpg`; an optional `LID_IMAGE.jpg` overrides `HOME_4.jpg` as the plain bed image). |
@@ -173,26 +174,22 @@ Glowforge (the serial from `HW_OCOTP_MAC0`, the password from `HW_OCOTP_SRK0..7`
 
 You must have [serial](https://docs.forgefirm.org/install/serial-access/) access to your device.
 
-Hostname is simple.  It's the identifier shown at the command prompt (use all caps).  
+The hostname is the identifier shown at the command prompt (use all caps).
 
-To obtain the serial number, enter the following in the python shell on your GF:
+To obtain the serial number and the password, enter the following in a
+Python shell on the machine (the factory kernel exposes the fuses under
+`/sys/fsl_otp`; on ForgeFIRM, `gfhardware.id` reads the same words through
+nvmem):
 ```python
-  def read_file(filename):
-      with open(filename) as f:
-          return f.read()
-  int(read_file('/sys/fsl_otp/HW_OCOTP_MAC0'), 16)
+def read_file(filename):
+    with open(filename) as f:
+        return f.read()
+
+print(int(read_file('/sys/fsl_otp/HW_OCOTP_MAC0'), 16))
+print(''.join('%08x' % int(read_file('/sys/fsl_otp/HW_OCOTP_SRK%d' % x), 16)
+              for x in range(8)))
 ```
-To obtain the password, enter the following in the python shell on your GF:
-```python
-  def read_file(filename):
-      with open(filename) as f:
-          return f.read()
-  password = ''
-  for x in range(8):
-      password += "%08x" % int(read_file('/sys/fsl_otp/HW_OCOTP_SRK%d' % d), 16)
-  print password
-```
-> **DO NOT SHARE your serial or password — they cannot be changed. Keep them secret.**
+> **DO NOT SHARE your serial or password - they cannot be changed. Keep them secret.**
 
 ## Running the emulator
 
@@ -224,7 +221,7 @@ The emulator handles each and replies with the appropriate events:
 | Action | Emulator behavior |
 |---|---|
 | `settings` | Sends the full [machine settings](#machine-settings) report. |
-| `update_check` | Ignored. |
+| `update_check` | Answers `update_check:completed` after the version probe; nothing is installed. |
 | `hunt` | Downloads the focus-homing pulse file; emits `hunt:starting` / `hunt:completed`. |
 | `lid_image` / `head_image` / `lidar_image` | "Captures" a canned JPEG and **uploads it to the presigned storage URL** supplied in the action's `endpoint` field; emits `:capture:*` and `:upload:*` events. |
 | `motion` | Downloads and parses the motion pulse file; emits `motion:starting` / `motion:completed`. |
@@ -240,18 +237,22 @@ Glowforge-Utilities/
 │   ├── configuration.py       # INI config parsing, get_cfg / set_cfg
 │   ├── service/
 │   │   ├── authentication.py  # machine sign-in (HTTPS)
+│   │   ├── dispatch.py        # action-name to machine-method dispatch table
 │   │   ├── gfuiservice.py     # GFUIService: connect + action dispatch loop
+│   │   ├── offline.py         # file:// and sink adapters for offline runs
 │   │   └── websocket.py       # WSS client, HTTP helpers, image upload, pulse download
 │   ├── device/
 │   │   ├── basemachine.py     # BaseMachine abstract base + action threads
 │   │   ├── emulator.py        # Emulator: canned-image / pulse-file machine
 │   │   └── settings.py        # MACHINE_SETTINGS schema + settings report
 │   └── puls/
-│       └── pulsedata.py       # decode_all_steps, generate_linear_puls
+│       ├── pulsedata.py       # decode_all_steps, generate_linear_puls
+│       └── source.py          # PulseSource: a pulse body streamed past the ring
 ├── examples/
 │   ├── gf-machine-emulator.py         # runnable emulator entry point
 │   ├── gf-machine-emulator.cfg.sample # configuration template
 │   └── _RESOURCES/                    # IMG/ MOTION/ FW/ LOG/ assets
+├── tests/                             # host tests (pytest)
 ├── requirements.txt
 ├── setup.py
 ├── LICENSE
@@ -264,7 +265,7 @@ Glowforge-Utilities/
 |---|---|
 | `GFUIService` ([service/gfuiservice.py](gfutilities/service/gfuiservice.py)) | Top-level connector: authenticates, checks firmware, opens the WSS channel, and runs the action-dispatch loop. |
 | `authenticate_machine` ([service/authentication.py](gfutilities/service/authentication.py)) | Signs the machine in over HTTPS (with retry/back-off) and stores the auth/WS tokens. |
-| `WsClient` + helpers ([service/websocket.py](gfutilities/service/websocket.py)) | `websocket-client` control channel plus HTTP helpers: `firmware_check` (version probe only — factory firmware is never downloaded), `img_upload`, `load_motion`, `send_wss_event`. |
+| `WsClient` + helpers ([service/websocket.py](gfutilities/service/websocket.py)) | `websocket-client` control channel plus HTTP helpers: `firmware_check` (version probe only - factory firmware is never downloaded), `img_upload`, `load_motion`, `send_wss_event`. |
 | `BaseMachine` ([device/basemachine.py](gfutilities/device/basemachine.py)) | Abstract base implementing the action lifecycle and threading; concrete machines override the `_initialize`, `_head_image`, `_lid_image`, `_hunt`, `_motion`, `_button_wait`, and `_shutdown` hooks. |
 | `Emulator` ([device/emulator.py](gfutilities/device/emulator.py)) | The reference `BaseMachine` implementation used by the example. |
 | `settings` ([device/settings.py](gfutilities/device/settings.py)) | `MACHINE_SETTINGS` schema and the `send_report` settings-report builder. |
@@ -279,8 +280,8 @@ than canned assets.
 ## The pulse (`.puls`) file format
 
 Motion, hunt, and print "pulse" files describe a job. Each begins with a small
-header — a magic (`GF1`), a header length, and a series of 4-character
-key/value tags (machine-setting overrides for the job) — followed by a raw,
+header - a magic (`GF1`), a header length, and a series of 4-character
+key/value tags (machine-setting overrides for the job) - followed by a raw,
 per-tick step/laser byte-stream that clocks the X/Y/Z steppers and the laser.
 
 - `load_motion()` downloads a pulse file, parses the header (buffering across
@@ -313,7 +314,7 @@ The example configures both a console handler and a file handler; set
 - Exercised against Glowforge production firmware **`2.6.0-2228`**.
 
 Because the protocol is undocumented and changes without notice, compatibility
-with any given service/firmware version is **not guaranteed** — see the
+with any given service/firmware version is **not guaranteed** - see the
 disclaimer.
 
 ## License
