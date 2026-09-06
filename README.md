@@ -154,6 +154,7 @@ taken as it is).
 |---|---|---|
 | `[SERVICE]` | `server_url` | HTTPS API base (default `https://app.glowforge.com`). |
 | | `status_service_url` | WebSocket control URL (`wss://status.glowforge.com`). |
+| | `user_agent` | The User-Agent the service sees (default `OpenGlow/<fw_version>`). |
 | `[MACHINE]` | `serial`, `password` | **Credentials** the machine signs in with (see below). |
 | | `hostname`, `head_id`, `head_serial`, `head_firmware` | Optional identity overrides reported in the settings report. |
 | `[FACTORY_FIRMWARE]` | `check` | Whether to probe the advertised firmware version at connect. |

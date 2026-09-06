@@ -1,6 +1,8 @@
 [SERVICE]
 server_url: https://app.glowforge.com
 status_service_url: wss://status.glowforge.com
+# The User-Agent the service sees. Unset = OpenGlow/<factory firmware version>.
+# user_agent: OpenGlow/2.6.0-2228
 
 [MACHINE]
 # See below for instructions on obtaining this information

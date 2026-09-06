@@ -271,6 +271,23 @@ def firmware_check(s: Session) -> Union[dict, bool]:
         return False
 
 
+DEFAULT_USER_AGENT_PRODUCT = 'OpenGlow'
+
+
+def user_agent() -> str:
+    """
+    The User-Agent the web service and the WebSocket see.
+    SERVICE.USER_AGENT from the configuration when set; otherwise the
+    library default, OpenGlow/<FACTORY_FIRMWARE.FW_VERSION>.
+    :return: User-Agent header value
+    :rtype: str
+    """
+    configured = get_cfg('SERVICE.USER_AGENT')
+    if configured:
+        return str(configured)
+    return '%s/%s' % (DEFAULT_USER_AGENT_PRODUCT, get_cfg('FACTORY_FIRMWARE.FW_VERSION'))
+
+
 def get_session() -> Session:
     """
     Creates web api session object.
@@ -283,7 +300,7 @@ def get_session() -> Session:
     # minutes, so a cancel can reach the job it belongs to.
     s.mount("https://", HTTPAdapter(max_retries=Retry(
         total=4, backoff_factor=1, backoff_max=8, allowed_methods=["GET"])))
-    set_cfg('SESSION.USER_AGENT', 'OpenGlow/%s' % get_cfg('FACTORY_FIRMWARE.FW_VERSION'))
+    set_cfg('SESSION.USER_AGENT', user_agent())
     s.headers.update({'user-agent': get_cfg('SESSION.USER_AGENT')})
     logger.debug('Returning object : %s' % s)
     return s
