@@ -383,6 +383,20 @@ def check_puls_header(header: dict, serial: Any = None) -> Union[str, None]:
     if fmt != 0:
         return 'unsupported pulse data format PDfm=%r' % (fmt,)
 
+    # XSmm and YSmm name the microstep mode the service planned the stream
+    # for, and the mode this client sets the drivers to for the job. Every
+    # header the service has sent carries 8, the factory's own analog
+    # config, and 8 is the only mode a cloud job has been run at here; the
+    # service plans the stream at its scale whatever the machine reports.
+    # A header at any other mode is a stream this machine has never run,
+    # so it is refused before a byte reaches the ring, and the log line is
+    # the report that starts the work on finer modes in cloud mode. A
+    # header without the tags runs at 8, the mode the client sets at start.
+    for tag in ('XSmm', 'YSmm'):
+        mode = header.get(tag)
+        if mode is not None and mode != 8:
+            return 'unsupported microstep mode %s=%r: cloud jobs run at 8 only' % (tag, mode)
+
     return None
 
 

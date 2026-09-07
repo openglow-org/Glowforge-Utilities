@@ -82,6 +82,26 @@ def test_unusable_step_frequency_is_refused():
         assert reason is not None and 'STfr' in reason
 
 
+def test_the_service_microstep_mode_is_accepted():
+    # Every header the service has sent carries 8 on both axes.
+    assert check_puls_header(_header(XSmm=8, YSmm=8), 123456) is None
+
+
+def test_a_header_without_microstep_tags_is_accepted():
+    # The client sets the drivers to 8 at start; a header that says nothing
+    # runs at that.
+    assert check_puls_header(_header(), 123456) is None
+
+
+def test_another_microstep_mode_is_refused():
+    # A finer mode is a stream this machine has never run in cloud mode:
+    # refused before the ring, and the log line is the report that starts
+    # the work on it.
+    for tag, mode in (('XSmm', 16), ('YSmm', 32), ('XSmm', 1), ('YSmm', 4)):
+        reason = check_puls_header(_header(**{tag: mode}), 123456)
+        assert reason is not None and tag in reason and '8' in reason, (tag, mode, reason)
+
+
 def test_refusal_happens_in_a_fixed_order():
     # A header wrong in several ways reports the step frequency first: it is
     # the field the run-time math needs, and the one already checked before
