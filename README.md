@@ -1,333 +1,79 @@
 # Glowforge Utilities (`gfutilities`)
 
-[![PyPI version](https://img.shields.io/pypi/v/gfutilities.svg)](https://pypi.org/project/gfutilities/)
-[![Python versions](https://img.shields.io/pypi/pyversions/gfutilities.svg)](https://pypi.org/project/gfutilities/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+The machine side of the Glowforge cloud workflow, as a Python library:
+authentication, the WebSocket control channel, action dispatch, the machine
+settings report, and pulse-file handling. It also carries a **machine
+emulator** that speaks the real protocol without any hardware attached.
 
-A collection of utilities to aid in firmware development for the
-[Glowforge](https://glowforge.com/) laser cutter. Its centerpiece is a **machine
-emulator** that authenticates to the Glowforge cloud service, speaks the
-real-time control protocol, and responds to the service the way a physical
-Glowforge does - useful for studying the protocol, exercising the cloud
-workflow, and as a foundation for alternative control software.
+It is the protocol and service layer that
+[ForgeFIRM](https://github.com/openglow-org/forgefirm)'s cloud mode is built
+on, and it is useful on its own to anyone who wants to see how a Glowforge
+talks to its service.
 
----
+> **The Glowforge protocol is undocumented and can change without notice.**
+> Compatibility with any given service or firmware version is not guaranteed.
+> This project is not affiliated with or endorsed by Glowforge.
 
-> ## ⚠️ Disclaimer - please read
->
-> This project is **not affiliated nor endorsed by Glowforge, Inc.**
->
-> As Glowforge's own software is in continuous BETA, so will this software.
-> It is recommended not to rely on this code for production as Glowforge does
-> not publish their protocols nor do they provide any change notices.
->
-> As a result, **this code may break without warning.**
->
-> ## USE AT YOUR OWN RISK!
+## Documentation
 
----
+Everything is on **<https://docs.forgefirm.org/>**. This README is an index
+card.
 
-## Table of contents
+| Subject | Page |
+|---|---|
+| The wire protocol: the two channels, sign-in, the envelopes, the actions, the events, progress reporting | [Cloud protocol](https://docs.forgefirm.org/technical/machine/cloud-protocol/) |
+| This library: the components, the configuration file, the emulator, the project layout, the machine settings schema | [Cloud mode](https://docs.forgefirm.org/technical/forgefirm/cloud-mode/) |
+| The pulse file and its header, tag by tag | [Factory firmware](https://docs.forgefirm.org/technical/machine/factory-firmware/) |
+| Getting a machine's own credentials | [Cloud mode, for the operator](https://docs.forgefirm.org/usage/cloud-mode/) |
 
-- [What it does](#what-it-does)
-- [How it works](#how-it-works)
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Running the emulator](#running-the-emulator)
-- [Startup / action sequence](#startup--action-sequence)
-- [Project layout](#project-layout)
-- [Library overview](#library-overview)
-- [The pulse (`.puls`) file format](#the-pulse-puls-file-format)
-- [Machine settings](#machine-settings)
-- [Logging](#logging)
-- [Compatibility](#compatibility)
-- [License](#license)
+## Install
 
-## What it does
-
-`gfutilities` implements the machine side of the Glowforge cloud workflow:
-
-- **Authenticates** a machine to the web service (`/machines/sign_in`) using its
-  serial number and password, retrieving the session and WebSocket tokens.
-- **Probes the factory firmware version** the service advertises. Nothing is
-  downloaded or installed; the probe feeds a compatibility banner.
-- Opens the **real-time WebSocket control channel** to the status service and
-  reacts to the service's *action* messages.
-- **Emulates** a machine's responses: it reports the full machine **settings**
-  schema, uploads camera images, downloads and parses **motion ("pulse")
-  files**, and emits the lifecycle **events** the service expects (`:starting`,
-  `:capture:*`, `:upload:*`, `:completed`, …).
-- Provides helpers for working with the **pulse byte-stream** format (decoding
-  motion statistics, generating simple linear moves).
-
-The bundled [`examples/gf-machine-emulator.py`](examples/gf-machine-emulator.py)
-ties these together into a runnable emulator. The `Emulator` responds to the
-service with canned camera images and the downloaded motion files, so a full
-homing → motion → print cycle completes without any hardware attached.
-
-## How it works
-
-Two channels are used, mirroring the real device:
-
-1. **HTTPS (`requests`)** - sign-in, the firmware version probe, image upload,
-   and motion (pulse) file download.
-2. **WebSocket (`websocket-client`)** - a persistent, auto-reconnecting control
-   channel (subprotocol `glowforge`) carrying JSON *action* messages from the
-   service and *event* messages from the machine.
-
-```
-                        ┌──────────────────────────────┐
-   HTTPS  sign_in /     │     Glowforge cloud          │
-   version / images /   │  app.glowforge.com (HTTPS)   │
-   motion files         │  status.glowforge.com (WSS)  │
-            ┌──────────▶└─────────────┬────────────────┘
-            │                         │    WSS: action messages  ▲ events
-            │                         ▼                          │
-   ┌────────┴────────┐        ┌─────────────────┐       ┌────────┴─────────┐
-   │  authentication │        │   WsClient      │──────▶│   GFUIService    │
-   │  websocket(HTTP)│        │ (websocket-     │  rx   │  dispatch loop   │
-   └─────────────────┘        │   client thread)│◀──────│                  │
-                              └─────────────────┘  tx   └────────┬─────────┘
-                                                                 │ actions
-                                                                 ▼
-                                                    ┌─────────────────────────┐
-                                                    │  BaseMachine / Emulator │
-                                                    │  (settings, images,     │
-                                                    │   motion/pulse files)   │
-                                                    └─────────────────────────┘
-```
-
-`GFUIService` owns the receive/transmit queues and dispatches each incoming
-action to the machine object; the machine performs the work (capture, upload,
-download, etc.) and pushes status events back onto the transmit queue, which the
-`WsClient` drains to the service.
-
-## Requirements
-
-- **Python 3.8+**
-- [`requests`](https://pypi.org/project/requests/) ≥ 2.31
-- [`urllib3`](https://pypi.org/project/urllib3/) ≥ 2
-- [`websocket-client`](https://pypi.org/project/websocket-client/) ≥ 1.7
-
-(See [`requirements.txt`](requirements.txt) / [`setup.py`](setup.py).)
-
-## Installation
-
-Install the latest release from [PyPI](https://pypi.org/project/gfutilities/):
-
-```bash
+```sh
 pip install gfutilities
 ```
 
-Or install from source (for development, or to track `master`):
+From source, for development:
 
-```bash
+```sh
 git clone https://github.com/openglow-org/Glowforge-Utilities.git
 cd Glowforge-Utilities
-
-# (recommended) create and activate a virtual environment
 python -m venv .venv
-# Windows:  .venv\Scripts\activate
-# POSIX:    source .venv/bin/activate
-
-pip install -e .          # editable install (or `pip install .`)
+. .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -e .
 ```
 
-## Configuration
+Python 3.8 or newer, with `requests` 2.31 or newer, `urllib3` 2 or newer, and
+`websocket-client` 1.7 or newer.
 
-The emulator is driven by an INI-style configuration file. Copy the sample and
-edit it:
+## Run the emulator
 
-```bash
+`examples/gf-machine-emulator.py` ties the library together into a runnable
+machine. It answers the service with canned camera images and the downloaded
+motion files, so a full homing, motion and print cycle completes with no
+hardware. Run it from `examples/`, so its relative resource paths resolve:
+
+```sh
 cd examples
 cp gf-machine-emulator.cfg.sample gf-machine-emulator.cfg
-```
-
-Configuration is parsed by [`gfutilities/configuration.py`](gfutilities/configuration.py):
-section/option names are upper-cased into flat `SECTION.OPTION` keys, the literal
-strings `True`/`False` become booleans, and `%(name)s` refers to another key of
-the same section (a value that merely contains a `%`, such as a password, is
-taken as it is).
-
-| Section | Key | Purpose |
-|---|---|---|
-| `[SERVICE]` | `server_url` | HTTPS API base (default `https://app.glowforge.com`). |
-| | `status_service_url` | WebSocket control URL (`wss://status.glowforge.com`). |
-| | `user_agent` | The User-Agent the service sees (default `OpenGlow/<fw_version>`). |
-| `[MACHINE]` | `serial`, `password` | **Credentials** the machine signs in with (see below). |
-| | `hostname`, `head_id`, `head_serial`, `head_firmware` | Optional identity overrides reported in the settings report. |
-| `[FACTORY_FIRMWARE]` | `check` | Whether to probe the advertised firmware version at connect. |
-| | `fw_version`, `app_version` | Optional reported-version overrides. |
-| `[EMULATOR]` | `base_dir` | Root for the emulator's resource folders. |
-| | `image_src_dir` | Canned camera images (`HOME_1..4.jpg`, `HEAD_*.jpg`; an optional `LID_IMAGE.jpg` overrides `HOME_4.jpg` as the plain bed image). |
-| | `motion_dl_dir` | Where downloaded motion/pulse files are written. |
-| | `bypass_homing` | Experimental: start with the homing cycle skipped. |
-| | `material_thickness` | Selects which canned head image to return. |
-| `[LOGGING]` | `file`, `level`, `console_level` | Log file path and log levels (the example's handlers). |
-| | `save_puls`, `save_sent_images`, `dir` | Optional debug captures of downloaded pulse files and uploaded images, written under `dir` (both off by default). |
-| `[THERMAL]`, `[MOTION]` | … | Additional tunables read from the config file. |
-
-### Obtaining your machine credentials
-
-`serial` and `password` are derived from the i.MX6 OCOTP fuses on a real
-Glowforge (the serial from `HW_OCOTP_MAC0`, the password from `HW_OCOTP_SRK0..7`).
-
-You must have [serial](https://docs.forgefirm.org/install/serial-access/) access to your device.
-
-The hostname is the identifier shown at the command prompt (use all caps).
-
-To obtain the serial number and the password, enter the following in a
-Python shell on the machine (the factory kernel exposes the fuses under
-`/sys/fsl_otp`; on ForgeFIRM, `gfhardware.id` reads the same words through
-nvmem):
-```python
-def read_file(filename):
-    with open(filename) as f:
-        return f.read()
-
-print(int(read_file('/sys/fsl_otp/HW_OCOTP_MAC0'), 16))
-print(''.join('%08x' % int(read_file('/sys/fsl_otp/HW_OCOTP_SRK%d' % x), 16)
-              for x in range(8)))
-```
-> **DO NOT SHARE your serial or password - they cannot be changed. Keep them secret.**
-
-## Running the emulator
-
-Run from the `examples/` directory so the relative `_RESOURCES` paths and the
-`gf-machine-emulator.cfg` file resolve correctly:
-
-```bash
-cd examples
 python gf-machine-emulator.py
 ```
 
-The entry point parses `gf-machine-emulator.cfg`, configures logging, then:
+The configuration file needs a machine's serial and password, which come from
+the processor's fuses. **They cannot be changed, so keep them secret.**
+[Cloud mode](https://docs.forgefirm.org/usage/cloud-mode/) shows how to read
+them.
 
-```python
-from gfutilities.configuration import parse
-from gfutilities import GFUIService, Emulator
+## Test
 
-parse('gf-machine-emulator.cfg')
-service = GFUIService(Emulator())
-service.connect()   # sign in, check firmware, open the WSS channel
-service.run()       # dispatch service actions until interrupted
+```sh
+python3 -m pytest tests/
 ```
 
-## Startup / action sequence
+## Contributing
 
-Once connected, the service drives the machine through a sequence of actions.
-The emulator handles each and replies with the appropriate events:
-
-| Action | Emulator behavior |
-|---|---|
-| `settings` | Sends the full [machine settings](#machine-settings) report. |
-| `update_check` | Answers `update_check:completed` after the version probe; nothing is installed. |
-| `hunt` | Downloads the focus-homing pulse file; emits `hunt:starting` / `hunt:completed`. |
-| `lid_image` / `head_image` / `lidar_image` | "Captures" a canned JPEG and **uploads it to the presigned storage URL** supplied in the action's `endpoint` field; emits `:capture:*` and `:upload:*` events. |
-| `motion` | Downloads and parses the motion pulse file; emits `motion:starting` / `motion:completed`. |
-| `print` | Downloads the print pulse file, waits for the button, then emits the warmup/running/return-to-home/completed events. |
-
-## Project layout
-
-```
-Glowforge-Utilities/
-├── gfutilities/
-│   ├── __init__.py            # exports GFUIService, Emulator, BaseMachine
-│   ├── _common.py             # LOGGER_NAME, MachineSetting namedtuple
-│   ├── configuration.py       # INI config parsing, get_cfg / set_cfg
-│   ├── service/
-│   │   ├── authentication.py  # machine sign-in (HTTPS)
-│   │   ├── dispatch.py        # action-name to machine-method dispatch table
-│   │   ├── gfuiservice.py     # GFUIService: connect + action dispatch loop
-│   │   ├── offline.py         # file:// and sink adapters for offline runs
-│   │   └── websocket.py       # WSS client, HTTP helpers, image upload, pulse download
-│   ├── device/
-│   │   ├── basemachine.py     # BaseMachine abstract base + action threads
-│   │   ├── emulator.py        # Emulator: canned-image / pulse-file machine
-│   │   └── settings.py        # MACHINE_SETTINGS schema + settings report
-│   └── puls/
-│       ├── pulsedata.py       # decode_all_steps, generate_linear_puls
-│       └── source.py          # PulseSource: a pulse body streamed past the ring
-├── examples/
-│   ├── gf-machine-emulator.py         # runnable emulator entry point
-│   ├── gf-machine-emulator.cfg.sample # configuration template
-│   └── _RESOURCES/                    # IMG/ MOTION/ FW/ LOG/ assets
-├── tests/                             # host tests (pytest)
-├── requirements.txt
-├── setup.py
-├── LICENSE
-└── README.md
-```
-
-## Library overview
-
-| Component | Responsibility |
-|---|---|
-| `GFUIService` ([service/gfuiservice.py](gfutilities/service/gfuiservice.py)) | Top-level connector: authenticates, checks firmware, opens the WSS channel, and runs the action-dispatch loop. |
-| `authenticate_machine` ([service/authentication.py](gfutilities/service/authentication.py)) | Signs the machine in over HTTPS (with retry/back-off) and stores the auth/WS tokens. |
-| `WsClient` + helpers ([service/websocket.py](gfutilities/service/websocket.py)) | `websocket-client` control channel plus HTTP helpers: `firmware_check` (version probe only - factory firmware is never downloaded), `img_upload`, `load_motion`, `send_wss_event`. |
-| `BaseMachine` ([device/basemachine.py](gfutilities/device/basemachine.py)) | Abstract base implementing the action lifecycle and threading; concrete machines override the `_initialize`, `_head_image`, `_lid_image`, `_hunt`, `_motion`, `_button_wait`, and `_shutdown` hooks. |
-| `Emulator` ([device/emulator.py](gfutilities/device/emulator.py)) | The reference `BaseMachine` implementation used by the example. |
-| `settings` ([device/settings.py](gfutilities/device/settings.py)) | `MACHINE_SETTINGS` schema and the `send_report` settings-report builder. |
-| `puls` ([puls/pulsedata.py](gfutilities/puls/pulsedata.py)) | `decode_all_steps` (motion statistics from a pulse stream) and `generate_linear_puls`. |
-
-### Extending
-
-`BaseMachine` is the extension point: subclass it (as `Emulator` does) and
-implement the hardware hooks to back the cloud protocol with something other
-than canned assets.
-
-## The pulse (`.puls`) file format
-
-Motion, hunt, and print "pulse" files describe a job. Each begins with a small
-header - a magic (`GF1`), a header length, and a series of 4-character
-key/value tags (machine-setting overrides for the job) - followed by a raw,
-per-tick step/laser byte-stream that clocks the X/Y/Z steppers and the laser.
-
-- `load_motion()` downloads a pulse file, parses the header (buffering across
-  chunks so headers larger than one read are handled), writes the body, and
-  returns header data plus computed motion statistics.
-- `decode_all_steps()` decodes a pulse byte-stream into per-axis step counts and
-  converts them to millimeters/inches.
-- `generate_linear_puls()` produces a simple trapezoidal-profile linear move.
-
-## Machine settings
-
-`MACHINE_SETTINGS` in [device/settings.py](gfutilities/device/settings.py) is the
-catalog of 4-character setting codes the machine exchanges with the service
-(`<2-char subsystem><2-char field>`, e.g. `EFid` = exhaust-fan idle duty,
-`HTvl` = head-temperature value). `send_report()` serializes the reportable
-entries into the settings report the service requests at startup. Each entry is
-a `MachineSetting(type, in_report, min, max, default, …)`.
-
-## Logging
-
-Logging uses the standard `logging` module under the logger name `openglow`.
-The example configures both a console handler and a file handler; set
-`[LOGGING] level` / `console_level` to `DEBUG`, `INFO`, `WARNING`, `ERROR`, or
-`CRITICAL`.
-
-## Compatibility
-
-- Runs on current Python (3.8+; developed/tested on 3.14) with modern
-  `requests` / `urllib3` 2.x / `websocket-client`.
-- Exercised against Glowforge production firmware **`2.6.0-2228`**.
-
-Because the protocol is undocumented and changes without notice, compatibility
-with any given service/firmware version is **not guaranteed** - see the
-disclaimer.
+[AGENTS.md](AGENTS.md) carries the rules for this repository and for the
+project. They apply to human contributors too.
 
 ## License
 
-[MIT](LICENSE) © 2026 Scott Wiederhold &lt;s.e.wiederhold@gmail.com&gt;
-
----
-
-> ## ⚠️ Reminder
->
-> This project is **not affiliated nor endorsed by Glowforge, Inc.**, Glowforge's
-> protocols are undocumented and change without notice, and **this code may break
-> without warning.**
->
-> ## USE AT YOUR OWN RISK!
+MIT. See [LICENSE](LICENSE).
