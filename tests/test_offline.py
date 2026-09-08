@@ -3,8 +3,8 @@ The offline service: a local socket in place of the web service, a
 file-serving session in place of the web session, the same dispatch and
 the same events.
 
-(C) Copyright 2026
-Scott Wiederhold, s.e.wiederhold@gmail.com
+Copyright 2026 514 LLC d/b/a OpenGlow
+Written by Scott Wiederhold
 https://community.openglow.org
 
 SPDX-License-Identifier:    MIT

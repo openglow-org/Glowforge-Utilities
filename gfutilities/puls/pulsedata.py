@@ -1,6 +1,6 @@
 """
-(C) Copyright 2020
-Scott Wiederhold, s.e.wiederhold@gmail.com
+Copyright 2020 514 LLC d/b/a OpenGlow
+Written by Scott Wiederhold
 https://community.openglow.org
 
 SPDX-License-Identifier:    MIT

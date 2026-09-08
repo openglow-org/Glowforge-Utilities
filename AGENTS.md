@@ -236,6 +236,12 @@ docstrings, log and console text, commit messages, issue text, and replies.
   affiliation disclaimer lives in the site footer only. It is also the user's
   responsibility to make sure that they stay within the vendor's terms of
   service when they use a feature that calls that vendor's cloud services.
+- **Copyright.** Copyright in this project belongs to 514 LLC d/b/a
+  OpenGlow. Every new source file carries two lines in its header, in the
+  comment style of the file: `Copyright <year> 514 LLC d/b/a OpenGlow` and
+  `Written by Scott Wiederhold`. Keep the year, or the year range, that
+  the file already has. The copyright notices of other holders stay
+  unchanged.
 - **SPDX.** Every new source file carries an `SPDX-License-Identifier` line
   under the license of its repository.
 
@@ -302,7 +308,8 @@ docstrings, log and console text, commit messages, issue text, and replies.
 3. For a component that ships in the image: the acceptance catalog covers the
    changed behavior, or the commit message says why it has no catalog
    consequence.
-4. New files carry an SPDX line. Line endings are LF.
+4. New files carry the 514 LLC d/b/a OpenGlow copyright, the `Written by`
+   line, and an SPDX line. Line endings are LF.
 5. No em dashes, no British spellings, no workstation paths, no bench
    identity, no factory firmware code, no history narrative, no AI
    attribution.

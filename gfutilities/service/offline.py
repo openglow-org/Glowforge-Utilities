@@ -17,8 +17,8 @@ service would, one JSON object per line (``id``, ``action_type``,
 would have sent the service comes back the same way, one JSON object per
 line, to every connected client, and is logged.
 
-(C) Copyright 2026
-Scott Wiederhold, s.e.wiederhold@gmail.com
+Copyright 2026 514 LLC d/b/a OpenGlow
+Written by Scott Wiederhold
 https://community.openglow.org
 
 SPDX-License-Identifier:    MIT
