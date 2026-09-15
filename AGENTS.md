@@ -107,6 +107,9 @@ does.
   test with the fix, in the same commit, never after.
 - Position counters, homing anchors, and a homed flag are not proof of
   physical motion. The head accelerometer is, and so are the operator's eyes.
+- Unreadable is fail-closed. A failed read of a safety input, a state file,
+  or a verdict is never treated as "still running" or "keep waiting" without
+  a bound.
 
 ### Proof before done
 
