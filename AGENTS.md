@@ -244,7 +244,11 @@ docstrings, log and console text, commit messages, issue text, and replies.
   comment style of the file: `Copyright <year> 514 LLC d/b/a OpenGlow` and
   `Written by Scott Wiederhold`. Keep the year, or the year range, that
   the file already has. The copyright notices of other holders stay
-  unchanged.
+  unchanged. Those two lines are for files this project authors: an
+  outside contributor who writes a new file puts their own name there, or
+  leaves the lines out, and keeps their copyright in what they wrote.
+  Editing an existing file changes no header - a contribution is recorded
+  by its `Signed-off-by` line and by git, not by a copyright line.
 - **SPDX.** Every new source file carries an `SPDX-License-Identifier` line
   under the license of its repository.
 
