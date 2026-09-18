@@ -12,7 +12,8 @@ talks to its service.
 
 > **The Glowforge protocol is undocumented and can change without notice.**
 > Compatibility with any given service or firmware version is not guaranteed.
-> This project is not affiliated with or endorsed by Glowforge.
+> Glowforge is a trademark of Glowforge, Inc. This project is not affiliated
+> with, authorized by, or endorsed by Glowforge, Inc.
 
 ## Documentation
 
