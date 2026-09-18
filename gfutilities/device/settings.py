@@ -4,6 +4,17 @@ Written by Scott Wiederhold
 https://community.openglow.org
 
 SPDX-License-Identifier:    MIT
+
+MACHINE_SETTINGS below describes the Glowforge service protocol's machine
+settings: the four-character keys the service and the machine exchange, with
+the type, reported-to-service flag, range and default observed for each.
+
+It is a description of that protocol, not a copy of anything from it. The keys
+and their behavior were determined by observing traffic between a machine and
+the service; the listing is exhaustive and ordered by key, so what it contains
+and how it is arranged are dictated by the protocol rather than chosen. It is
+recorded here for one purpose: so that independently written software can
+interoperate with the service and with the machine.
 """
 import logging
 from queue import Queue
