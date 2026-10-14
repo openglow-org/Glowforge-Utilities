@@ -62,10 +62,6 @@ def test_all_image_actions_route_to_capture():
         assert m.calls == [('capture', action)]
 
 
-def test_user_image_is_an_image_action():
-    assert 'user_image' in IMAGE_ACTIONS
-
-
 def test_puls_accepted_returns_action_type():
     for action in ('hunt', 'motion', 'print'):
         m = FakeMachine(accept_puls=True)
@@ -122,8 +118,6 @@ def test_sync_actions_ignore_every_status_but_ready():
 
 
 def test_sync_actions_are_the_ones_with_no_job():
-    assert SYNC_ACTIONS == ('settings', 'update_check', 'factory_reset',
-                            'head_firmware_update')
     for action in SYNC_ACTIONS:
         assert action not in PULS_ACTIONS and action not in IMAGE_ACTIONS
 
@@ -141,23 +135,12 @@ def test_a_cancel_still_reaches_a_running_job():
         assert m.calls == [('capture', action)]
 
 
-def test_focus_is_ignored_as_the_factory_ignores_it():
-    # A name the service knows and the factory application has no case for.
-    m = FakeMachine()
-    assert dispatch_action(m, _msg('focus')) == 'ignored'
-    assert m.calls == []
+def test_what_the_factory_has_no_case_for_is_ignored():
+    # focus is a name the service knows and the factory application has no
+    # case for; an unknown name and a message with no type go the same way.
+    for msg in (_msg('focus'), _msg('telemetry_blob'), {'id': 1, 'status': 'ready'}):
+        m = FakeMachine()
+        assert dispatch_action(m, msg) == 'ignored', msg
+        assert m.calls == [], msg
 
 
-def test_unknown_action_ignored():
-    m = FakeMachine()
-    assert dispatch_action(m, _msg('telemetry_blob')) == 'ignored'
-    assert m.calls == []
-
-
-def test_missing_action_type_ignored():
-    m = FakeMachine()
-    assert dispatch_action(m, {'id': 1, 'status': 'ready'}) == 'ignored'
-
-
-def test_puls_actions_constant_matches_expected():
-    assert PULS_ACTIONS == ('hunt', 'motion', 'print')

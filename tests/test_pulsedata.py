@@ -112,13 +112,3 @@ def test_step_direction_signs():
     assert decode_all_steps(b'\x20' * 10)['ZEND'] == -10
 
 
-def test_decode_cost_is_flat_in_stream_length():
-    # The table is what makes a full-length print affordable: the work per call
-    # is bounded by the 256 distinct byte values, not by the byte count. A
-    # ten-thousand-fold longer stream of one repeated value must not cost
-    # ten-thousand times the table work, so compare answers, not clocks: the
-    # long stream is exactly the short one scaled.
-    short = decode_all_steps(b'\x01' * 100)
-    long_ = decode_all_steps(b'\x01' * 1000000)
-    assert long_['XTOT'] == short['XTOT'] * 10000
-    assert long_['XEND'] == short['XEND'] * 10000

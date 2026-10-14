@@ -12,29 +12,17 @@ from gfutilities.service import websocket
 from gfutilities.service.websocket import send_wss_progress, split_frame
 
 
-def test_single_object_frame():
-    assert split_frame('{"a":1}') == ['{"a":1}']
-
-
-def test_multi_object_frame_splits_each():
-    frame = '{"id":32,"type":"log"}\n{"id":33,"type":"event"}'
-    parts = split_frame(frame)
-    assert len(parts) == 2
-    assert [json.loads(p)['id'] for p in parts] == [32, 33]
-
-
-def test_blank_lines_dropped():
-    frame = '\n{"a":1}\n\n  \n{"b":2}\n'
-    assert split_frame(frame) == ['{"a":1}', '{"b":2}']
-
-
-def test_empty_frame_yields_nothing():
-    assert split_frame('') == []
-    assert split_frame('\n  \n') == []
-
-
-def test_whitespace_trimmed():
-    assert split_frame('   {"a":1}   ') == ['{"a":1}']
+def test_a_frame_splits_into_its_objects():
+    # One object, several (one per line), blank lines dropped, an empty
+    # frame, and the whitespace around an object trimmed.
+    for frame, want in (('{"a":1}', ['{"a":1}']),
+                        ('{"id":32,"type":"log"}\n{"id":33,"type":"event"}',
+                         ['{"id":32,"type":"log"}', '{"id":33,"type":"event"}']),
+                        ('\n{"a":1}\n\n  \n{"b":2}\n', ['{"a":1}', '{"b":2}']),
+                        ('', []),
+                        ('\n  \n', []),
+                        ('   {"a":1}   ', ['{"a":1}'])):
+        assert split_frame(frame) == want, frame
 
 
 # -- the progress frame ---------------------------------------------------

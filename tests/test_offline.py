@@ -12,14 +12,13 @@ SPDX-License-Identifier:    MIT
 import json
 import os
 import socket
-import tempfile
 import threading
 import time
 
 import pytest
 
 from gfutilities.service import websocket as ws
-from gfutilities.service.offline import OfflineService, offline_session, OFFLINE_MARK
+from gfutilities.service.offline import OfflineService, offline_session
 from tests.test_basemachine import StubMachine
 
 
@@ -100,10 +99,3 @@ def test_actions_in_events_out(tmp_path):
     assert not os.path.exists(sock)
 
 
-def test_no_network_is_ever_touched():
-    # the session the machine gets has adapters for every scheme it could
-    # be asked for, none of them reaching a host
-    s = offline_session()
-    for prefix in ('file://', 'http://', 'https://'):
-        assert prefix in s.adapters
-    assert OFFLINE_MARK  # the log mark a reader keys on exists

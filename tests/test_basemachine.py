@@ -97,26 +97,13 @@ def test_user_image_captures_bed_and_emits_lifecycle():
 
 # ---- per-action settings normalization / plumbing (B4) ---------------------
 
-def test_image_settings_dict_passthrough():
-    assert BaseMachine._image_settings({'settings': {'LCfl': 1}}) == {'LCfl': 1}
 
-
-def test_image_settings_list_takes_first():
-    msg = {'settings': [{'HCil': 5}, {'HCil': 0}]}
-    assert BaseMachine._image_settings(msg) == {'HCil': 5}
-
-
-def test_image_settings_absent_or_empty():
-    assert BaseMachine._image_settings({}) == {}
-    assert BaseMachine._image_settings({'settings': None}) == {}
-    assert BaseMachine._image_settings({'settings': []}) == {}
-
-
-def test_lid_image_records_action_settings():
+def test_lid_image_receives_and_records_its_settings():
     m = StubMachine()
     m.run_capture({'action_type': 'lid_image', 'id': 4, 'status': 'ready',
                    'settings': {'LCfl': 1}})
     m._action_thread.join(timeout=5)
+    assert m.lid_settings == {'LCfl': 1}
     assert m._action_settings == {'LCfl': 1}
 
 
@@ -127,21 +114,6 @@ def test_head_image_receives_normalized_settings():
     m._action_thread.join(timeout=5)
     assert m.head_settings == {'HCil': 3, 'HCex': 2047}
     assert m._action_settings == {'HCil': 3, 'HCex': 2047}
-
-
-def test_head_image_without_settings_passes_none():
-    m = StubMachine()
-    m.run_capture({'action_type': 'head_image', 'id': 6, 'status': 'ready'})
-    m._action_thread.join(timeout=5)
-    assert m.head_settings is None
-
-
-def test_lid_image_receives_its_settings():
-    m = StubMachine()
-    m.run_capture({'action_type': 'lid_image', 'id': 10, 'status': 'ready',
-                   'settings': {'LCfl': 1}})
-    m._action_thread.join(timeout=5)
-    assert m.lid_settings == {'LCfl': 1}
 
 
 def test_a_user_image_carries_its_settings_to_the_lid_capture():

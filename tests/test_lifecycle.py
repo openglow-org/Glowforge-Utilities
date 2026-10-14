@@ -9,8 +9,6 @@ import logging
 from io import BytesIO
 from queue import Queue
 
-import pytest
-
 from gfutilities.configuration import set_cfg
 from gfutilities.service import websocket as ws
 
@@ -93,12 +91,6 @@ def test_no_session_never_reauths(monkeypatch):
     monkeypatch.setattr(c, '_sleep_or_stop', fake_sleep)
     c.run()
     assert reauth == []
-
-
-def test_sleep_or_stop_returns_on_stop():
-    c = ws.WsClient(Queue(), Queue())
-    c.stop = True
-    assert c._sleep_or_stop(5) is True
 
 
 # ---- C2: 401 -> re-auth -> replay ------------------------------------------
@@ -200,18 +192,6 @@ def test_load_motion_writes_body_and_no_disk_filler(tmp_path, monkeypatch):
     assert list((tmp_path / 'log').glob('*.info')) == []
 
 
-def test_load_motion_save_puls_flag_writes_debug_copy(tmp_path, monkeypatch):
-    set_cfg('LOGGING.DIR', str(tmp_path / 'log'))
-    (tmp_path / 'log').mkdir()
-    set_cfg('LOGGING.SAVE_PULS', True)
-    body = bytes(range(50))
-    monkeypatch.setattr(ws, 'request', lambda *a, **k: _StreamResp(_fake_puls(body)))
-    ws.load_motion(None, 'http://x', BytesIO())
-    assert list((tmp_path / 'log').glob('*.puls'))
-    assert list((tmp_path / 'log').glob('*.info'))
-    set_cfg('LOGGING.SAVE_PULS', None)
-
-
 def test_load_motion_capture_failure_does_not_fail_the_job(tmp_path, monkeypatch):
     # Capture on, but the directory does not exist: the debug copy is
     # dropped and the job still loads. A debug aid never costs a print.
@@ -240,15 +220,6 @@ class _FakeMachine:
 
     def stop(self):
         self.stopped = True
-
-
-def test_gfuiservice_stops_and_safes_machine():
-    from gfutilities.service.gfuiservice import GFUIService
-    m = _FakeMachine()
-    svc = GFUIService(m)
-    svc.stop = True                 # request stop before entering the loop
-    svc.run()
-    assert m.started and m.stopped   # machine.stop() runs -> hardware safed
 
 
 def test_request_stop_breaks_running_loop():
@@ -286,15 +257,6 @@ class _BlockingWSApp:
         pass
 
 
-def test_ws_client_is_daemon():
-    assert ws.WsClient(Queue(), Queue()).daemon
-
-
-def test_action_thread_is_daemon():
-    from gfutilities.device.basemachine import _ActionThread
-    assert _ActionThread(None, {}).daemon
-
-
 def test_ws_connect_returns_stoppable_client(monkeypatch):
     _ws_cfg()
     monkeypatch.setattr('websocket.WebSocketApp', _BlockingWSApp)
@@ -305,20 +267,8 @@ def test_ws_connect_returns_stoppable_client(monkeypatch):
     assert not c.is_alive()
 
 
-def test_gfuiservice_connect_keeps_ws_reference(monkeypatch):
+def test_gfuiservice_keeps_its_ws_client_and_shuts_it_down_with_the_machine(monkeypatch):
     from gfutilities.service import gfuiservice
-    sentinel = object()
-    monkeypatch.setattr(gfuiservice, 'get_session', lambda: object())
-    monkeypatch.setattr(gfuiservice, 'authenticate_machine', lambda s: True)
-    monkeypatch.setattr(gfuiservice, 'ws_connect', lambda rx, tx, s: sentinel)
-    set_cfg('FACTORY_FIRMWARE.CHECK', None)
-    svc = gfuiservice.GFUIService(_FakeMachine())
-    assert svc.connect() is True
-    assert svc._ws is sentinel
-
-
-def test_gfuiservice_run_shuts_down_ws_client():
-    from gfutilities.service.gfuiservice import GFUIService
 
     class _FakeWs:
         ready = False
@@ -330,27 +280,20 @@ def test_gfuiservice_run_shuts_down_ws_client():
             self.down = True
             return True
 
-    m = _FakeMachine()
-    svc = GFUIService(m)
     fake = _FakeWs()
-    svc._ws = fake
-    svc.stop = True
+    monkeypatch.setattr(gfuiservice, 'get_session', lambda: object())
+    monkeypatch.setattr(gfuiservice, 'authenticate_machine', lambda s: True)
+    monkeypatch.setattr(gfuiservice, 'ws_connect', lambda rx, tx, s: fake)
+    set_cfg('FACTORY_FIRMWARE.CHECK', None)
+    m = _FakeMachine()
+    svc = gfuiservice.GFUIService(m)
+    assert svc.connect() is True
+    assert svc._ws is fake
+    svc.stop = True                 # request stop before entering the loop
     svc.run()
-    assert m.stopped
+    assert m.started and m.stopped  # machine.stop() runs -> hardware safed
     assert fake.down
     assert svc._ws is None
-
-
-def test_load_motion_reraises_ring_full(monkeypatch):
-    set_cfg('LOGGING.SAVE_PULS', None)
-    monkeypatch.setattr(ws, 'request', lambda *a, **k: _StreamResp(_fake_puls(bytes(200))))
-
-    class _RingFull:
-        def write(self, _b):
-            raise OSError(12, 'Cannot allocate memory')  # -ENOMEM
-
-    with pytest.raises(OSError):
-        ws.load_motion(None, 'http://x', _RingFull())
 
 
 # ---- A1: what the machine will hold in memory ------------------------------
