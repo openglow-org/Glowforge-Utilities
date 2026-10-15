@@ -97,6 +97,13 @@ def test_user_image_captures_bed_and_emits_lifecycle():
 
 # ---- per-action settings normalization / plumbing (B4) ---------------------
 
+def test_image_settings_without_a_usable_entry_are_empty():
+    # The service sends settings as a dict, as a list of dicts (lidar), or
+    # not at all; a null and an empty list both mean no settings, never an
+    # error.
+    for msg in ({}, {'settings': None}, {'settings': []}):
+        assert BaseMachine._image_settings(msg) == {}, msg
+
 
 def test_lid_image_receives_and_records_its_settings():
     m = StubMachine()
