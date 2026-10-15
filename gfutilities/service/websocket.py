@@ -529,10 +529,8 @@ def load_motion(s: Session, url: str, out_file) -> Union[dict, bool]:
     if not info:
         return False
 
-    # out_file may be a path or an already-open binary file object. A machine
-    # streaming to the exclusive-open pulse device holds one flock'd fd for
-    # the whole job (the kernel dead man's switch) and passes it in here; in
-    # that case the caller owns the fd and it must not be closed.
+    # out_file is a path, opened and closed here, or an already-open writable
+    # object, which the caller owns and which is not closed here.
     from contextlib import nullcontext
     if hasattr(out_file, 'write'):
         out_ctx = nullcontext(out_file)
@@ -580,9 +578,8 @@ def load_motion(s: Session, url: str, out_file) -> Union[dict, bool]:
                         raw = None
                         save_puls = False
         except OSError as e:
-            # The pulse device rejects a write once its ring is full
-            # (-ENOMEM), i.e. the job is larger than the device can buffer.
-            # Log a clear reason and re-raise so the caller safes the machine.
+            # A write error ends the download: log how far it got, then
+            # raise it to the caller, whose destination it is.
             logger.error('pulse write failed after %d bytes - the job may exceed '
                          'the device ring capacity: %s' % (size, e))
             raise
