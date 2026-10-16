@@ -5,8 +5,10 @@ https://community.openglow.org
 
 SPDX-License-Identifier:    MIT
 """
+import errno
 import logging
-from io import BytesIO
+import os
+from io import BufferedWriter, BytesIO, RawIOBase
 from queue import Queue
 
 from gfutilities.configuration import set_cfg
@@ -192,20 +194,47 @@ def test_load_motion_writes_body_and_no_disk_filler(tmp_path, monkeypatch):
     assert list((tmp_path / 'log').glob('*.info')) == []
 
 
+class _FullDisk(RawIOBase):
+    """A file on a full disk: the device refuses every write."""
+
+    def writable(self):
+        return True
+
+    def write(self, b):
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+
 def test_load_motion_capture_failure_does_not_fail_the_job(tmp_path, monkeypatch):
-    # Capture on, but the directory does not exist: the debug copy is
-    # dropped and the job still loads. A debug aid never costs a print.
-    set_cfg('LOGGING.DIR', str(tmp_path / 'gone'))
+    # Capture on, and the capture fails: the debug copy is dropped and the
+    # job still loads. A debug aid never costs a print. The directory does
+    # not exist; or the disk is full, which the buffered capture meets at
+    # its close for a payload inside one write chunk, and at the first
+    # chunk for a longer one.
+    real_open = open
+
+    def full_disk(path, *args, **kwargs):
+        if str(path).endswith('.puls'):
+            return BufferedWriter(_FullDisk(), buffer_size=8192)
+        return real_open(path, *args, **kwargs)
+
+    (tmp_path / 'log').mkdir()
+    rows = (('no directory', tmp_path / 'gone', bytes(range(50))),
+            ('full disk at the close', tmp_path / 'log', bytes(range(50))),
+            ('full disk at a chunk', tmp_path / 'log', bytes(range(256)) * 1100))
     set_cfg('LOGGING.SAVE_PULS', True)
-    body = bytes(range(50))
-    monkeypatch.setattr(ws, 'request', lambda *a, **k: _StreamResp(_fake_puls(body)))
-    out = BytesIO()
     try:
-        info = ws.load_motion(None, 'http://x', out)
+        for name, log_dir, body in rows:
+            set_cfg('LOGGING.DIR', str(log_dir))
+            if name.startswith('full disk'):
+                monkeypatch.setattr(ws, 'open', full_disk, raising=False)
+            data = _fake_puls(body)
+            monkeypatch.setattr(ws, 'request', lambda *a, **k: _StreamResp(data))
+            out = BytesIO()
+            info = ws.load_motion(None, 'http://x', out)
+            assert out.getvalue() == body, name
+            assert info['size'] == len(body), name
     finally:
         set_cfg('LOGGING.SAVE_PULS', None)
-    assert out.getvalue() == body
-    assert info['size'] == len(body)
 
 
 # ---- D1a: GFUIService stoppable --------------------------------------------

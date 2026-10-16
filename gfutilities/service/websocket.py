@@ -508,6 +508,18 @@ def motion_run_time(info: dict, size: int) -> timedelta:
     return timedelta(seconds=size / info['header_data']['STfr'])
 
 
+def _close_capture(raw) -> bool:
+    """Closes the debug capture of load_motion. A close that fails (a full
+    disk refuses the bytes still in the buffer) drops the capture with a
+    warning and never costs the job. Returns False when the close failed."""
+    try:
+        raw.close()
+        return True
+    except OSError as e:
+        logger.warning('pulse capture not closed: %s' % e)
+        return False
+
+
 def load_motion(s: Session, url: str, out_file) -> Union[dict, bool]:
     """
     Downloads a motion/print file and writes its payload out.
@@ -554,7 +566,7 @@ def load_motion(s: Session, url: str, out_file) -> Union[dict, bool]:
             # directory or a full disk drops it and the print runs on.
             logger.warning('pulse capture disabled: %s' % e)
             if raw:
-                raw.close()
+                _close_capture(raw)
             raw = None
             save_puls = False
 
@@ -574,7 +586,7 @@ def load_motion(s: Session, url: str, out_file) -> Union[dict, bool]:
                         raw.write(chunk)
                     except OSError as e:
                         logger.warning('pulse capture stopped: %s' % e)
-                        raw.close()
+                        _close_capture(raw)
                         raw = None
                         save_puls = False
         except OSError as e:
@@ -583,8 +595,8 @@ def load_motion(s: Session, url: str, out_file) -> Union[dict, bool]:
             logger.error('pulse write failed after %d bytes: %s' % (size, e))
             raise
         finally:
-            if raw:
-                raw.close()
+            if raw and not _close_capture(raw):
+                save_puls = False
 
     info['size'] = size
     info['run_time'] = motion_run_time(info, size)
