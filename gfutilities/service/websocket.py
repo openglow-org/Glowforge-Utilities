@@ -400,7 +400,7 @@ def check_puls_header(header: dict, serial: Any = None) -> Union[str, None]:
     return None
 
 
-# Bytes taken off the socket, and handed to the ring, at a time.
+# Bytes taken off the socket, and written out by load_motion, at a time.
 _DOWNLOAD_CHUNK = 64 * 1024
 _WRITE_CHUNK = 256 * 1024
 
@@ -510,18 +510,18 @@ def motion_run_time(info: dict, size: int) -> timedelta:
 
 def load_motion(s: Session, url: str, out_file) -> Union[dict, bool]:
     """
-    Downloads a motion/print file and writes all of it out.
+    Downloads a motion/print file and writes its payload out.
 
-    This is the whole-job path: everything is enqueued before anything plays,
-    so the destination has to be able to take the entire job. A job longer
-    than the ring is fed with gfhardware's feeder instead.
+    The payload (the pulse data after the header, inflated when the service
+    compressed it) is written to out_file in full before this returns.
 
     :param s: Requests Session object
     :type s: Session
     :param url: Target URL
     :type url: str
-    :param out_file: Where to write the results
-    :type out_file: str
+    :param out_file: Where to write the payload: a path, or a writable
+        binary object that the caller owns
+    :type out_file: str or a writable binary object
     :return: Header dict or False on failure
     :rtype: Union[dict, bool]
     """
@@ -566,9 +566,9 @@ def load_motion(s: Session, url: str, out_file) -> Union[dict, bool]:
                 chunk = source.read(_WRITE_CHUNK)
                 if not chunk:
                     break
-                size += len(chunk)
                 stat = decode_all_steps(chunk, stat)
                 f.write(chunk)
+                size += len(chunk)
                 if raw:
                     try:
                         raw.write(chunk)
@@ -580,8 +580,7 @@ def load_motion(s: Session, url: str, out_file) -> Union[dict, bool]:
         except OSError as e:
             # A write error ends the download: log how far it got, then
             # raise it to the caller, whose destination it is.
-            logger.error('pulse write failed after %d bytes - the job may exceed '
-                         'the device ring capacity: %s' % (size, e))
+            logger.error('pulse write failed after %d bytes: %s' % (size, e))
             raise
         finally:
             if raw:
