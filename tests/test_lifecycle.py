@@ -205,11 +205,11 @@ class _FullDisk(RawIOBase):
 
 
 def test_load_motion_capture_failure_does_not_fail_the_job(tmp_path, monkeypatch):
-    # Capture on, and the capture fails: the debug copy is dropped and the
-    # job still loads. A debug aid never costs a print. The directory does
-    # not exist; or the disk is full, which the buffered capture meets at
-    # its close for a payload inside one write chunk, and at the first
-    # chunk for a longer one.
+    # Capture on, and the capture fails: the debug copy is dropped, with no
+    # .info, and the job still loads. A debug aid never costs a print. The
+    # directory does not exist; or the disk is full, which the buffered
+    # capture meets at its close when the header and the payload fit in
+    # its write buffer, and at the first chunk write when they do not.
     real_open = open
 
     def full_disk(path, *args, **kwargs):
@@ -233,6 +233,7 @@ def test_load_motion_capture_failure_does_not_fail_the_job(tmp_path, monkeypatch
             info = ws.load_motion(None, 'http://x', out)
             assert out.getvalue() == body, name
             assert info['size'] == len(body), name
+            assert list((tmp_path / 'log').glob('*.info')) == [], name
     finally:
         set_cfg('LOGGING.SAVE_PULS', None)
 

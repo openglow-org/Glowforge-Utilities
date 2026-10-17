@@ -516,7 +516,7 @@ def _close_capture(raw) -> bool:
         raw.close()
         return True
     except OSError as e:
-        logger.warning('pulse capture not closed: %s' % e)
+        logger.warning('pulse capture closed incomplete: %s' % e)
         return False
 
 
