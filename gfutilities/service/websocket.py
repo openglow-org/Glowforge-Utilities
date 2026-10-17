@@ -532,7 +532,8 @@ def load_motion(s: Session, url: str, out_file) -> Union[dict, bool]:
     :param url: Target URL
     :type url: str
     :param out_file: Where to write the payload: a path, or a writable
-        binary object that the caller owns
+        binary object that the caller owns. Its write must take every
+        byte or raise, as a file opened 'wb' and a BytesIO do
     :type out_file: str or a writable binary object
     :return: Header dict or False on failure
     :rtype: Union[dict, bool]
