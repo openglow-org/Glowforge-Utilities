@@ -52,7 +52,7 @@ ForgeFIRM is open firmware for stock Glowforge lasers (Basic, Plus, Pro). It
 runs on the factory NXP i.MX6 control board with no hardware modification. It
 replaces the cloud-dependent factory userspace with an open Linux image that
 controls the machine locally. In GRBL mode the machine is a standard grblHAL
-controller for LightBurn and other senders on TCP port 23. Cloud mode runs the
+controller for a Grbl sender on TCP port 23. Cloud mode runs the
 factory experience through the Glowforge web service, and it is a deliberate,
 maintained feature. The stack is hardware validated: GRBL mode cuts real jobs,
 and cloud mode runs end to end.
