@@ -18,7 +18,6 @@ status_service_url: wss://status.glowforge.com
 
 [FACTORY_FIRMWARE]
 check: True
-download_dir: _RESOURCES/FW
 # Below only needed if you want to override
 # fw_version: 2.6.0-2228
 # app_version: 370ee0b4dad80d10d088b6b65fd10a9144eff5a5
@@ -26,8 +25,6 @@ download_dir: _RESOURCES/FW
 
 [EMULATOR]
 base_dir: _RESOURCES
-firmware_check: True
-firmware_dl_dir: %(base_dir)s/FW
 motion_dl_dir: %(base_dir)s/MOTION
 image_src_dir: %(base_dir)s/IMG
 # Experimental - This may bypass the homing cycle, under certain unknown conditions

@@ -8,15 +8,21 @@ SPDX-License-Identifier:    MIT
 from datetime import timedelta
 import json
 import logging
+import os
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
+import random
+import re
 import requests
 from requests import Request, Response, Session
 from requests.adapters import HTTPAdapter
+import urllib3
 from urllib3.util.retry import Retry
-from threading import Lock, Thread
+from urllib.parse import urlsplit
+from threading import Event, Lock, Thread
 import time
 from typing import Any, Union
+import zlib
 
 import websocket
 
@@ -25,14 +31,197 @@ from gfutilities.configuration import get_cfg, set_cfg
 from gfutilities.puls import decode_all_steps
 from gfutilities.puls.source import PulseSource, PulseSourceError
 
-start_time = time.time()
+# Event timestamps count milliseconds on the monotonic clock from the start
+# of this process: the board has no real-time clock, and a wall clock that
+# NTP sets after the start would move every later stamp.
+_START_MONOTONIC = time.monotonic()
 response_id = 31
 _response_id_lock = Lock()
 
-# Events queued while the socket is down are stale on reconnect; past this
-# depth new events are dropped (with a warning) instead of growing the
-# queue without bound.
+# Events queued while the socket is down go out after the reconnect, in the
+# order they were queued; past this depth new events are dropped (with a
+# warning) instead of growing the queue without bound.
 TX_QUEUE_MAX = 1000
+
+# A text frame longer than this is dropped unread: no service action comes
+# near it, and every frame is held and split in memory.
+FRAME_MAX_CHARS = 1024 * 1024
+
+# The reconnect waits RECONNECT_BASE_S after a lost session, doubling after
+# each failed attempt up to RECONNECT_MAX_S, each wait drawn between half
+# and all of its value. A session that stayed up RECONNECT_RESET_S starts
+# the count again, so the routine hourly drop reconnects at once.
+RECONNECT_BASE_S = 5.0
+RECONNECT_MAX_S = 300.0
+RECONNECT_RESET_S = 60.0
+
+# The WebSocket library's socket timeout, which also bounds its handshake:
+# without one, a peer that accepts the connection and never completes the
+# upgrade holds the client thread in a read forever.
+WS_SOCKET_TIMEOUT_S = 20
+
+# The sign-in and the firmware probe answer with a small JSON object: one
+# past this many decoded bytes is not one, and neither is a body of more than
+# twice this many bytes as sent (a gzip answer that decodes to little); either
+# is not read further.
+JSON_BODY_MAX_BYTES = 64 * 1024
+
+# The firmware probe's one attempt: seconds for the connect and for each
+# read, and a deadline counted from before the request and judged on every
+# receive of the answer's body (the head is bounded by the per-read timeout
+# only).
+FIRMWARE_PROBE_TIMEOUT_S = 5
+FIRMWARE_PROBE_DEADLINE_S = 10
+
+# The most a body read hands back at once where the response cannot hand
+# over what has arrived (no read1): small, so a stop or a deadline is judged
+# within the arrival of this many bytes.
+_SMALL_READ = 1024
+
+
+def _body_pieces(r, piece: int):
+    """The body exactly as the server sent it (never decoded), in pieces
+    handed over as they arrive: a piece is whatever the connection holds, up
+    to ``piece`` bytes, so a caller can judge a stop or a deadline on every
+    receive. A response that cannot hand over what has arrived reads in
+    pieces of _SMALL_READ; one with no raw stream at all falls back to its
+    decoded content."""
+    raw = getattr(r, 'raw', None)
+    read1 = getattr(type(raw), 'read1', None)
+    if (isinstance(raw, urllib3.HTTPResponse) and read1 is not None
+            and read1 is not getattr(urllib3.response.BaseHTTPResponse, 'read1', None)):
+        while True:
+            data = raw.read1(piece, decode_content=False)
+            if not data:
+                return
+            yield data
+    elif raw is not None and hasattr(raw, 'stream'):
+        yield from raw.stream(_SMALL_READ, decode_content=False)
+    else:
+        yield from r.iter_content(chunk_size=piece)
+
+
+def _url_for_log(url) -> str:
+    """A URL as the log shows it: the scheme, the host and the path, never
+    the query. A signed storage URL carries its credential in the query."""
+    return str(url).split('?', 1)[0]
+
+
+def _host(url) -> str:
+    """The host a URL names, lowercased, or '' when it names none."""
+    try:
+        return (urlsplit(str(url).replace('wss://', 'https://', 1)).hostname or '').lower()
+    except ValueError:
+        return ''
+
+
+def _is_service_url(url) -> bool:
+    """True when the URL is on the Glowforge service's own host
+    (SERVICE.SERVER_URL), the one host the machine's session token is for."""
+    service = _host(get_cfg('SERVICE.SERVER_URL') or '')
+    return bool(service) and _host(url) == service
+
+
+# The two action fields that carry a signed storage URL.
+_SIGNED_URL_FIELD = re.compile(r'("(?:motion_url|endpoint)"\s*:\s*"[^"?]*)\?[^"]*"')
+
+
+def _frame_for_log(message: str) -> str:
+    """A service frame as the debug log shows it: a signed storage URL in
+    motion_url or endpoint is cut at its query."""
+    return _SIGNED_URL_FIELD.sub(r'\1"', message)
+
+
+# A JSON answer is asked for in gzip, the one encoding _read_json reads,
+# whatever the installed decoders would have the session ask for.
+JSON_HEADERS = {'Accept-Encoding': 'gzip'}
+
+
+class _GzipMembers:
+    """Every member of a gzip body, inflated no further than ``room`` bytes
+    a feed, read as urllib3 reads one: the first member must be whole, and
+    after it what a later member decodes before it ends or fails is kept,
+    the rest of the body then dropped. An error inside the first member, or
+    a first member cut short, is the body's."""
+
+    def __init__(self):
+        self._d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        self._first = True
+        self._dropped = False
+
+    @property
+    def complete(self) -> bool:
+        return self._d.eof or not self._first
+
+    def feed(self, data: bytes, room: int) -> bytes:
+        out = bytearray()
+        while data and not self._dropped and len(out) < room:
+            if self._d.eof:
+                self._d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                self._first = False
+            try:
+                out += self._d.decompress(data, room - len(out))
+            except zlib.error:
+                if self._first:
+                    raise
+                self._dropped = True
+                break
+            data = self._d.unused_data if self._d.eof else self._d.unconsumed_tail
+        return bytes(out)
+
+
+def _read_json(r, cap: int = JSON_BODY_MAX_BYTES, deadline: float = None) -> Union[dict, None]:
+    """The JSON object of a small response, as sent or decoded from its gzip
+    Content-Encoding (every member), read no further than ``cap`` decoded
+    bytes and, when ``deadline`` (on the monotonic clock) is given, no later
+    than it: judged on every receive. None when the body is longer, comes
+    later, is in another encoding or does not decode (one cut short), is
+    more than twice ``cap`` bytes as sent, is not JSON, or is not an
+    object."""
+    body = bytearray()
+    sent = 0
+    headers = getattr(r, 'headers', None) or {}
+    encoding = (headers.get('Content-Encoding') or '').strip().lower()
+    try:
+        if encoding not in ('', 'identity', 'gzip', 'x-gzip'):
+            logger.error('response body in the %r encoding, which is not asked for; not read'
+                         % encoding[:32])
+            return None
+        # Only the raw stream is still encoded; the fallback is decoded.
+        inflate = None
+        if encoding in ('gzip', 'x-gzip') and getattr(r, 'raw', None) is not None:
+            inflate = _GzipMembers()
+        for piece in _body_pieces(r, 8192):
+            sent += len(piece)
+            if sent > 2 * cap:
+                logger.error('response body past %d bytes as sent; not read further' % (2 * cap))
+                return None
+            if inflate is not None:
+                piece = inflate.feed(piece, cap + 1 - len(body))
+            body += piece
+            if len(body) > cap:
+                logger.error('response body past %d bytes; not read further' % cap)
+                return None
+            if deadline is not None and _monotonic() > deadline:
+                logger.error('response body not read in time; not read further')
+                return None
+        if inflate is not None and not inflate.complete:
+            logger.error('response body ends inside its encoding')
+            return None
+        doc = json.loads(bytes(body))
+    except (requests.RequestException, urllib3.exceptions.HTTPError, OSError,
+            ValueError, RecursionError, zlib.error) as e:
+        logger.error('response body not read as JSON: %s' % type(e).__name__)
+        return None
+    finally:
+        try:
+            r.close()
+        except Exception:
+            pass
+    if not isinstance(doc, dict):
+        logger.error('response body is JSON, but not an object')
+        return None
+    return doc
 
 logger = logging.getLogger(LOGGER_NAME)
 
@@ -59,8 +248,19 @@ class WsClient(Thread):
         self.msg_q_tx = q_tx
         self.stop = False
         self.ready = False
+        # Set at the first completed handshake; ws_connect waits on it.
+        self.opened = Event()
+        # When the current session's handshake completed, or None.
+        self._opened_at = None
+        # When the reconnect loop last began a step (an attempt or a wait),
+        # on the monotonic clock: a loop that cycles keeps it fresh, and one
+        # stuck inside a step lets it age (the service loop reads it).
+        self.step_at = None
         self._session = session
         self.ws = None
+        # The frame the transmit pump took off the queue and has not sent:
+        # a send that fails keeps it here for the next session.
+        self._unsent = None
         # daemon: the client must never keep the process alive on its own.
         # Clean teardown is still explicit - see shutdown().
         Thread.__init__(self, daemon=True)
@@ -81,13 +281,19 @@ class WsClient(Thread):
         """WS handshake complete - ready to send/receive."""
         logger.info('RX-EVENT: ready')
         self.ready = True
+        self._opened_at = _monotonic()
+        self.opened.set()
 
     def _on_message(self, _ws, message) -> None:
         """Service sent us a message. Text frames arrive as str, binary frames as bytes."""
         if isinstance(message, (bytes, bytearray)):
             logger.error('UNEXPECTED BINARY RX-EVENT (%s bytes)' % len(message))
             return
-        logger.debug(message)
+        if len(message) > FRAME_MAX_CHARS:
+            logger.error('RX-EVENT of %d characters dropped unread (past %d)'
+                         % (len(message), FRAME_MAX_CHARS))
+            return
+        logger.debug(_frame_for_log(message))
         # The service packs several newline-delimited JSON objects into a
         # single text frame; enqueue each object on its own so the consumer
         # decodes one action at a time.
@@ -113,11 +319,14 @@ class WsClient(Thread):
         """
         Thread(target=self._tx_pump, daemon=True).start()
         first = True
+        delay = RECONNECT_BASE_S
         while not self.stop:
             # A transient failure anywhere in a session attempt (DNS blip
             # during re-auth, a raise out of run_forever) must not kill
             # this thread - the machine would silently go offline forever.
             # Log, back off, reconnect.
+            self._opened_at = None
+            self.step_at = _monotonic()
             try:
                 if not first and self._session is not None:
                     # Lazy import: authentication imports this module.
@@ -125,11 +334,14 @@ class WsClient(Thread):
                     logger.info('re-authenticating for a fresh ws_token')
                     if not authenticate_machine(self._session):
                         logger.error('re-auth failed; will retry')
-                        if self._sleep_or_stop(5):
+                        self.step_at = _monotonic()
+                        if self._sleep_or_stop(_jitter(delay)):
                             break
+                        delay = min(delay * 2, RECONNECT_MAX_S)
                         continue
                 first = False
                 self.ready = False
+                websocket.setdefaulttimeout(WS_SOCKET_TIMEOUT_S)
                 self.ws = self._build()
                 # ping_interval keeps the connection alive (standard WS ping/pong).
                 self.ws.run_forever(ping_interval=30, ping_timeout=10)
@@ -137,9 +349,13 @@ class WsClient(Thread):
                 logger.exception('WS session attempt failed; will reconnect')
             if self.stop:
                 break
+            if self._opened_at is not None and _monotonic() - self._opened_at >= RECONNECT_RESET_S:
+                delay = RECONNECT_BASE_S
             logger.info('RECONNECTING')
-            if self._sleep_or_stop(5):
+            self.step_at = _monotonic()
+            if self._sleep_or_stop(_jitter(delay)):
                 break
+            delay = min(delay * 2, RECONNECT_MAX_S)
         logger.info('CLOSING')
 
     def shutdown(self, timeout: float = 10) -> bool:
@@ -172,29 +388,44 @@ class WsClient(Thread):
 
     def _tx_pump(self) -> None:
         """
-        Drains the transmit queue and sends messages while the socket is open.
-        Runs until stop is requested, then closes the socket so run_forever() returns.
+        Sends the transmit queue's frames, in order, while the socket is
+        open. A frame whose send fails is kept and sent first once the
+        reconnect brings a new socket. Runs until stop is requested, then
+        closes the socket so run_forever() returns.
         :return:
         """
         while not self.stop:
-            if self.ready and not self.msg_q_tx.empty():
-                send_msg = self.msg_q_tx.get()
-                logger.info('TX-EVENT: ' + send_msg.strip())
+            if self._unsent is None:
                 try:
-                    self.ws.send(send_msg)
-                except Exception as e:
-                    # A socket-level error (the peer reset before on_close
-                    # fired) escapes send as an OSError, not a
-                    # WebSocketException. Nothing may end this thread: it
-                    # is the only sender for the life of the process. The
-                    # socket is done; the reconnect brings a new one.
-                    logger.error('TX FAILED: %s' % e)
-                    self.ready = False
+                    self._unsent = self.msg_q_tx.get(timeout=0.5)
+                except Empty:
+                    continue
                 self.msg_q_tx.task_done()
-            else:
+            if not self.ready:
                 time.sleep(0.1)
+                continue
+            logger.info('TX-EVENT: ' + self._unsent.strip())
+            try:
+                self.ws.send(self._unsent)
+                self._unsent = None
+            except Exception as e:
+                # A socket-level error (the peer reset before on_close
+                # fired) escapes send as an OSError, not a
+                # WebSocketException. Nothing may end this thread: it
+                # is the only sender for the life of the process. The
+                # socket is done; the reconnect brings a new one.
+                logger.error('TX FAILED: %s' % e)
+                self.ready = False
         if self.ws:
             self.ws.close()
+
+
+def _jitter(secs: float) -> float:
+    """A wait drawn between half of ``secs`` and all of it."""
+    return random.uniform(secs / 2, secs)
+
+
+_monotonic = time.monotonic
 
 
 def split_frame(message: str) -> list:
@@ -203,12 +434,18 @@ def split_frame(message: str) -> list:
 
     The service may pack several newline-delimited JSON objects into one
     frame; return each non-blank line so they can be decoded separately.
+    Only a newline separates them: U+2028 and its kin may stand raw inside
+    a JSON string.
     :param message: raw text frame
     :type message: str
     :return: list of JSON object strings (order preserved)
     :rtype: list
     """
-    return [line.strip() for line in message.splitlines() if line.strip()]
+    return [line.strip() for line in message.split('\n') if line.strip()]
+
+
+# A factory firmware version as the banner shows it.
+_FACTORY_VERSION = re.compile(r'[0-9A-Za-z._+-]{1,31}')
 
 
 def record_factory_latest(version: str) -> None:
@@ -218,30 +455,45 @@ def record_factory_latest(version: str) -> None:
     firmware; this only informs the operator whether the live Glowforge
     service has moved past the version this release was tested against.
     No-op unless FACTORY_FIRMWARE.STATUS_FILE is configured.
+
+    Only a string of 1 to 31 characters from [0-9A-Za-z._+-] is recorded;
+    anything else is logged and the file is left as it is. The file is
+    written whole to a temporary file and renamed over the old one, so a
+    reader sees the old record or the new one.
     :param version: version string reported by the service
     :type version: str
     """
     path = get_cfg('FACTORY_FIRMWARE.STATUS_FILE')
     if not path:
         return
+    if not isinstance(version, str) or not _FACTORY_VERSION.fullmatch(version):
+        logger.warning('service version not recorded: %.40r' % (version,))
+        return
+    tmp = '%s.tmp' % path
     try:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, 'w') as f:
+        with open(tmp, 'w') as f:
             json.dump({
                 'latest_gf_version': version,
                 'tested_against_gf': get_cfg('FACTORY_FIRMWARE.FW_VERSION'),
-                'checked_at': int(time.time()),
             }, f)
+        os.replace(tmp, path)
     except OSError as e:
         logger.warning('could not record factory-latest version: %s' % e)
 
 
-def firmware_check(s: Session) -> Union[dict, bool]:
+def firmware_check(s: Session) -> Union[dict, bool, None]:
     """
     Query the factory firmware version the service currently advertises and
     record it for the forgectrl compatibility banner. ForgeFIRM never
     downloads or installs factory firmware - this is a read-only version
     probe, not an update step.
+
+    One attempt through the session's own transport, with no retry and a
+    FIRMWARE_PROBE_TIMEOUT_S timeout on the connect and on each read, and a
+    FIRMWARE_PROBE_DEADLINE_S deadline counted from before the request and
+    judged on every receive of the answer's body, so a slow service holds the
+    caller (the action dispatch) for seconds, not minutes.
 
     Returns a {dict} when the advertised version differs from the version
     this release was tested against (FACTORY_FIRMWARE.FW_VERSION), meaning
@@ -249,15 +501,23 @@ def firmware_check(s: Session) -> Union[dict, bool]:
     {'version': '<latest factory version>', 'download_url': '<url>'}
     :param s: Requests Session object
     :type s: Session
-    :return: version dict when newer than our baseline, else False
-    :rtype: Union[dict, bool]
+    :return: version dict when newer than our baseline, False when it
+        matches, None when the probe failed (no answer, or an answer that is
+        not a JSON object)
+    :rtype: Union[dict, bool, None]
     """
     logger.info('CHECKING')
-    r = request(s, get_cfg('SERVICE.SERVER_URL') + '/update/current', 'GET')
+    deadline = _monotonic() + FIRMWARE_PROBE_DEADLINE_S
+    r = request(s, get_cfg('SERVICE.SERVER_URL') + '/update/current', 'GET',
+                timeout=FIRMWARE_PROBE_TIMEOUT_S, stream=True, retry=False,
+                headers=JSON_HEADERS)
     if not r:
         logger.error('FAILED')
-        return False
-    rj = r.json()
+        return None
+    rj = _read_json(r, deadline=deadline)
+    if rj is None:
+        logger.error('FAILED')
+        return None
     logger.debug(rj)
     if rj.get('version') is not None:
         record_factory_latest(rj['version'])
@@ -297,25 +557,33 @@ def get_session() -> Session:
     s = Session()
     # One adapter for the session's life. GET retries are short: a
     # pulse download on the action thread must give up in seconds, not
-    # minutes, so a cancel can reach the job it belongs to.
+    # minutes, so a cancel can reach the job it belongs to. A Retry-After
+    # the service sends is not honored: one of minutes would hold the job.
     s.mount("https://", HTTPAdapter(max_retries=Retry(
-        total=4, backoff_factor=1, backoff_max=8, allowed_methods=["GET"])))
+        total=4, backoff_factor=1, backoff_max=8, allowed_methods=["GET"],
+        respect_retry_after_header=False)))
     set_cfg('SESSION.USER_AGENT', user_agent())
     s.headers.update({'user-agent': get_cfg('SESSION.USER_AGENT')})
     logger.debug('Returning object : %s' % s)
     return s
 
 
+class ImageUploadError(Exception):
+    """An image the storage or the service did not take."""
+
+
 def img_upload(s: Session, img: bytes, msg: dict) -> bool:
     """
-    Uploads head/lid image
+    Uploads head/lid image. Returns True; an image that is not uploaded
+    raises (ImageUploadError, or the transport's own exception), so the
+    action that asked for it ends ':failed', never ':completed'.
     :param s: Requests Session object
     :type s: Session
     :param img: Path to file to upload, or bytes object containing image
     :type img: bytes
     :param msg: WSS message
     :type msg: dict
-    :return:
+    :return: True
     :rtype: bool
     """
     logger.info('START')
@@ -325,8 +593,13 @@ def img_upload(s: Session, img: bytes, msg: dict) -> bool:
         # action's "endpoint" field and the image is uploaded straight to it.
         # The presigned URL carries its own auth, so it must NOT go through the
         # authenticated Glowforge session (a Bearer header makes GCS reject it);
-        # PUT the raw bytes with a plain request.
-        r = requests.put(endpoint, data=img, headers={'Content-Type': 'image/jpeg'}, timeout=30)
+        # PUT the raw bytes with a plain request. Only over https, and no
+        # redirect is followed (a presigned PUT does not redirect): the image
+        # is the operator's bed.
+        if urlsplit(str(endpoint)).scheme != 'https':
+            raise ImageUploadError('the upload endpoint is not https (%s)' % _url_for_log(endpoint))
+        r = requests.put(endpoint, data=img, headers={'Content-Type': 'image/jpeg'}, timeout=30,
+                         allow_redirects=False)
         ok = r.status_code in (200, 201, 204)
     else:
         # Legacy fallback: POST to the app server (pre-2.6.0 behavior).
@@ -335,7 +608,7 @@ def img_upload(s: Session, img: bytes, msg: dict) -> bool:
         ok = bool(r)
     if not ok:
         logger.error('FAILED: %s %s' % (getattr(r, 'status_code', '?'), getattr(r, 'reason', '')))
-        return False
+        raise ImageUploadError('the image upload failed (%s)' % getattr(r, 'status_code', 'no answer'))
     logger.debug('upload response: %s' % r)
     logger.info('COMPLETE')
     return True
@@ -416,17 +689,14 @@ PULSE_REJECT_BYTES = 128 * 1024 * 1024
 
 
 def _body_stream(r, chunk: int = _DOWNLOAD_CHUNK):
-    """The body exactly as the service sent it, in pieces.
+    """The body exactly as the service sent it, in pieces as they arrive.
 
     The service serves pulse data compressed, tens to one, so keeping it
     undecoded is what lets a job of any length sit in a few MB of memory.
     A response that cannot hand over its raw stream falls back to the decoded
     one, which costs only memory.
     """
-    raw = getattr(r, 'raw', None)
-    if raw is not None and hasattr(raw, 'stream'):
-        return raw.stream(chunk, decode_content=False)
-    return r.iter_content(chunk_size=chunk)
+    return _body_pieces(r, chunk)
 
 
 def _declared_length(r) -> int:
@@ -437,8 +707,41 @@ def _declared_length(r) -> int:
         return 0
 
 
+# A download must keep moving: past DOWNLOAD_GRACE_S it must have averaged
+# at least DOWNLOAD_MIN_RATE bytes per second, or it is given up. A rate,
+# not a fixed cap: a long job on a slow link is still taken.
+DOWNLOAD_GRACE_S = 30.0
+DOWNLOAD_MIN_RATE = 16 * 1024
+
+# The response head: up to DOWNLOAD_ATTEMPTS attempts after a transport
+# failure, each with DOWNLOAD_TIMEOUT_S on the connect and DOWNLOAD_READ_S
+# on every read (the body's reads too: a pause in a body is taken up to that
+# long), a wait of 1, 2, 4 and 8 s between them. No attempt starts or waits
+# past DOWNLOAD_HEAD_S; an attempt under way is bounded by its own timeouts.
+# A stop is read before every attempt and through every wait.
+DOWNLOAD_ATTEMPTS = 5
+DOWNLOAD_TIMEOUT_S = 5.0
+DOWNLOAD_READ_S = 15.0
+DOWNLOAD_HEAD_S = 60.0
+
+_sleep = time.sleep
+
+
+def _wait_or_stop(secs: float, should_stop) -> bool:
+    """Wait ``secs`` on the monotonic clock, asking ``should_stop`` every
+    0.1 s. True as soon as it answers true."""
+    end = _monotonic() + secs
+    while True:
+        if should_stop is not None and should_stop():
+            return True
+        left = end - _monotonic()
+        if left <= 0:
+            return False
+        _sleep(min(0.1, left))
+
+
 def fetch_motion(s: Session, url: str, warn_bytes: int = PULSE_WARN_BYTES,
-                 reject_bytes: int = PULSE_REJECT_BYTES) -> tuple:
+                 reject_bytes: int = PULSE_REJECT_BYTES, should_stop=None) -> tuple:
     """Downloads a motion/print job into memory and parses its header.
 
     Returns ``(info, source)``, or ``(False, None)`` if the job is not one
@@ -446,18 +749,57 @@ def fetch_motion(s: Session, url: str, warn_bytes: int = PULSE_WARN_BYTES,
     fed from the returned source separately, so a job may be longer than the
     ring.
 
+    The URL must be https (or file, which only a session that serves files,
+    the offline one, can fetch). The session's Authorization goes only to the
+    service's own host, never to the storage host a signed URL names, and a
+    redirect is not followed: a signed storage URL does not redirect.
+
     ``warn_bytes`` and ``reject_bytes`` bound the body held in memory, not the
     job (see PULSE_WARN_BYTES). The declared length is checked before a byte is
     taken, and the running total is checked as it arrives, because a service
     that declares nothing - or declares wrongly - would otherwise be trusted
     with all the memory there is. Either may be 0 to lift it.
 
+    The response head gets DOWNLOAD_ATTEMPTS attempts, none started past
+    DOWNLOAD_HEAD_S (see there); an answer that is not 200 is not tried
+    again. The body is read as it arrives, each read bounded by
+    DOWNLOAD_READ_S.
+
+    ``should_stop``, when given, is asked before every attempt, through the
+    waits between them and on every receive of the body: once it answers
+    true the download ends with ``(False, None)``. So does a download slower
+    than DOWNLOAD_MIN_RATE past DOWNLOAD_GRACE_S, judged on every receive,
+    and a transport error in the body.
+
     :param s: Requests Session object
     :param url: Target URL
     :param warn_bytes: log a body at or past this size
     :param reject_bytes: refuse a body past this size
+    :param should_stop: callable read per piece; true ends the download
     """
-    r = request(s, url, 'GET', stream=True)
+    scheme = urlsplit(str(url)).scheme
+    if scheme not in ('https', 'file'):
+        logger.error('refusing the job: the pulse data URL is %s, not https (%s)'
+                     % (scheme or 'unnamed', _host(url)))
+        return False, None
+    headers = {} if _is_service_url(url) else {'Authorization': None}
+    head_deadline = _monotonic() + DOWNLOAD_HEAD_S
+    r = False
+    for attempt in range(DOWNLOAD_ATTEMPTS):
+        if should_stop is not None and should_stop():
+            logger.info('pulse data download stopped before an answer')
+            return False, None
+        failure = []
+        r = request(s, url, 'GET', timeout=(DOWNLOAD_TIMEOUT_S, DOWNLOAD_READ_S), stream=True,
+                    allow_redirects=False, headers=headers, retry=False, _failure=failure)
+        if r or failure != ['transport'] or attempt + 1 == DOWNLOAD_ATTEMPTS:
+            break
+        wait = min(2.0 ** attempt, head_deadline - _monotonic())
+        if wait <= 0:
+            break
+        if _wait_or_stop(wait, should_stop):
+            logger.info('pulse data download stopped before an answer')
+            return False, None
     if not r:
         logger.error('pulse data download failed')
         return False, None
@@ -468,13 +810,30 @@ def fetch_motion(s: Session, url: str, warn_bytes: int = PULSE_WARN_BYTES,
         r.close()
         return False, None
     body = bytearray()
-    for piece in _body_stream(r):
-        body += piece
-        if reject_bytes and len(body) > reject_bytes:
-            logger.error('refusing the job: the download passed the %d bytes this '
-                         'machine will hold (%d declared)' % (reject_bytes, declared))
-            r.close()
-            return False, None
+    started = _monotonic()
+    try:
+        for piece in _body_stream(r):
+            body += piece
+            if reject_bytes and len(body) > reject_bytes:
+                logger.error('refusing the job: the download passed the %d bytes this '
+                             'machine will hold (%d declared)' % (reject_bytes, declared))
+                r.close()
+                return False, None
+            if should_stop is not None and should_stop():
+                logger.info('pulse data download stopped after %d bytes' % len(body))
+                r.close()
+                return False, None
+            took = _monotonic() - started
+            if took > DOWNLOAD_GRACE_S + len(body) / DOWNLOAD_MIN_RATE:
+                logger.error('refusing the job: %d bytes in %.0f s is under the %d bytes/s '
+                             'a download must keep' % (len(body), took, DOWNLOAD_MIN_RATE))
+                r.close()
+                return False, None
+    except (requests.RequestException, urllib3.exceptions.HTTPError, OSError) as e:
+        logger.error('pulse data download failed after %d bytes: %s'
+                     % (len(body), type(e).__name__))
+        r.close()
+        return False, None
     if warn_bytes and len(body) >= warn_bytes:
         logger.warning('this job is %d bytes of pulse data, past the %d that is '
                        'the usual ceiling; the machine will run it' % (len(body), warn_bytes))
@@ -508,18 +867,6 @@ def motion_run_time(info: dict, size: int) -> timedelta:
     return timedelta(seconds=size / info['header_data']['STfr'])
 
 
-def _close_capture(raw) -> bool:
-    """Closes the debug capture of load_motion. A close that fails (a full
-    disk refuses the bytes still in the buffer) drops the capture with a
-    warning and never costs the job. Returns False when the close failed."""
-    try:
-        raw.close()
-        return True
-    except OSError as e:
-        logger.warning('pulse capture closed incomplete: %s' % e)
-        return False
-
-
 def load_motion(s: Session, url: str, out_file) -> Union[dict, bool]:
     """
     Downloads a motion/print file and writes its payload out.
@@ -550,27 +897,6 @@ def load_motion(s: Session, url: str, out_file) -> Union[dict, bool]:
     else:
         out_ctx = open(out_file, 'wb')
 
-    # Optional debug capture of the raw job, off by default (it copies every
-    # job into the capture directory, LOGGING.DIR). Enable with
-    # LOGGING.SAVE_PULS.
-    save_puls = get_cfg('LOGGING.SAVE_PULS') and get_cfg('LOGGING.DIR')
-    raw = None
-    base_file_name = None
-    if save_puls:
-        base_file_name = '%s/%s' % (get_cfg('LOGGING.DIR'),
-                                    time.strftime("%Y-%m-%d_%H%M%S"))
-        try:
-            raw = open(base_file_name + '.puls', 'wb')
-            raw.write(source.header_raw)
-        except OSError as e:
-            # The capture is a debug aid and never costs a job: a missing
-            # directory or a full disk drops it and the print runs on.
-            logger.warning('pulse capture disabled: %s' % e)
-            if raw:
-                _close_capture(raw)
-            raw = None
-            save_puls = False
-
     size = 0
     stat = None
     with out_ctx as f:
@@ -582,38 +908,26 @@ def load_motion(s: Session, url: str, out_file) -> Union[dict, bool]:
                 stat = decode_all_steps(chunk, stat)
                 f.write(chunk)
                 size += len(chunk)
-                if raw:
-                    try:
-                        raw.write(chunk)
-                    except OSError as e:
-                        logger.warning('pulse capture stopped: %s' % e)
-                        _close_capture(raw)
-                        raw = None
-                        save_puls = False
         except OSError as e:
             # A write error ends the download: log how far it got, then
             # raise it to the caller, whose destination it is.
             logger.error('pulse write failed after %d bytes: %s' % (size, e))
             raise
-        finally:
-            if raw and not _close_capture(raw):
-                save_puls = False
 
     info['size'] = size
     info['run_time'] = motion_run_time(info, size)
     info['stats'] = stat
-    if save_puls:
-        try:
-            with open(base_file_name + '.info', 'w') as jf:
-                jf.write(json.dumps(info, sort_keys=True, indent=4,
-                                    default=str) + '\n')
-        except OSError as e:
-            logger.warning('pulse capture info not written: %s' % e)
     return info
 
 
+# One attempt, no retry: what a session's retrying HTTP adapter is swapped
+# for when a caller asks for one attempt.
+_NO_RETRY = HTTPAdapter(max_retries=0)
+
+
 def request(s: Session, url: str, method: str, timeout: int = 15, stream: bool = False,
-            _retry_auth: bool = True, **kwargs) -> Union[Response, bool]:
+            _retry_auth: bool = True, allow_redirects: bool = True, retry: bool = True,
+            _failure: list = None, **kwargs) -> Union[Response, bool]:
     """
     Submits requests to provided url using the established Session object
     :param s: Requests Session object
@@ -626,9 +940,19 @@ def request(s: Session, url: str, method: str, timeout: int = 15, stream: bool =
     :type timeout: int
     :param stream: Stream
     :type stream: bool
-    :param _retry_auth: on a 401, re-sign-in and replay the request once.
-        The sign-in request itself passes False to avoid recursion.
+    :param _retry_auth: on a 401 from the service's own host, re-sign-in and
+        replay the request once. The sign-in request itself passes False to
+        avoid recursion. A 401 from another host is that host's answer.
     :type _retry_auth: bool
+    :param allow_redirects: follow a redirect (False: a 3xx is a failure)
+    :type allow_redirects: bool
+    :param retry: False sends one attempt through the adapter the session
+        mounts for the URL, a retrying HTTP adapter swapped for one that does
+        not retry; no redirect is followed then
+    :type retry: bool
+    :param _failure: a list that gets 'transport' when no answer came, or the
+        status code of an answer that is not 200
+    :type _failure: list
     :param kwargs:
     :return: Requests Response object, or False on error.
     :rtype: Union[Response, bool]
@@ -636,28 +960,56 @@ def request(s: Session, url: str, method: str, timeout: int = 15, stream: bool =
     req = Request(method, str.replace(str(url), 'wss://', 'https://'), **kwargs)
     prepared = s.prepare_request(req)
     try:
-        r = s.send(prepared, stream=stream, timeout=timeout)
+        if retry:
+            r = s.send(prepared, stream=stream, timeout=timeout,
+                       allow_redirects=allow_redirects)
+        else:
+            adapter = s.get_adapter(prepared.url)
+            if isinstance(adapter, HTTPAdapter) and adapter.max_retries.total:
+                adapter = _NO_RETRY
+            r = adapter.send(prepared, stream=stream, timeout=timeout,
+                             verify=s.verify, proxies=s.proxies, cert=s.cert)
     except requests.RequestException as e:
         # Network trouble is a routine condition (DNS blip, uplink drop,
         # timeout), not an exception to unwind a thread on: every caller
-        # already handles a False return as failure.
-        logger.error('request failed: %s' % e)
+        # already handles a False return as failure. The exception's text
+        # carries the URL's query, so only its type and the host are logged.
+        logger.error('request failed: %s (%s)' % (type(e).__name__, _host(url)))
+        if _failure is not None:
+            _failure.append('transport')
         return False
-    if r.status_code == 401 and _retry_auth:
+    if r.status_code == 401 and _retry_auth and _is_service_url(url):
         # The auth_token expired mid-session: re-sign-in (fresh Bearer) and
         # replay the request once. Lazy import - authentication imports us.
         logger.info('401 - re-authenticating and retrying')
         from gfutilities.service.authentication import authenticate_machine
         if authenticate_machine(s):
             return request(s, url, method, timeout=timeout, stream=stream,
-                           _retry_auth=False, **kwargs)
+                           _retry_auth=False, allow_redirects=allow_redirects,
+                           retry=retry, _failure=_failure, **kwargs)
     if r.status_code != 200:
-        logger.error('FAILED: ' + r.reason)
+        logger.error('FAILED: %s %s (%s)' % (r.status_code, r.reason, _host(url)))
+        if _failure is not None:
+            _failure.append(r.status_code)
         return False
     return r
 
 
+def _timestamp() -> int:
+    """An event's timestamp: milliseconds since this process started, on
+    the monotonic clock."""
+    return int((time.monotonic() - _START_MONOTONIC) * 1000)
+
+
+def _frame(fields: dict) -> str:
+    """The JSON text of an outbound frame's fields, in their order."""
+    return json.dumps(fields, separators=(',', ':'))
+
+
 def send_wss_event(msg_q_tx: Queue, action_id: Union[int, None], event: str, **kwargs):
+    """Queue one event frame. ``data``, when given, is ``{'key': name,
+    'value': <JSON text>}``: the value is placed in the frame as the JSON
+    text it is."""
     global response_id
     with _response_id_lock:      # called from several threads
         response_id += 1
@@ -667,17 +1019,16 @@ def send_wss_event(msg_q_tx: Queue, action_id: Union[int, None], event: str, **k
         logger.warning('event TX queue full (socket down?); dropping %s' % event)
         return
 
+    fields = {'id': rid, 'timestamp': _timestamp(), 'type': 'event', 'version': 1}
+    if action_id is not None:
+        fields['action_id'] = action_id
+    fields['level'] = 'INFO'
+    fields['event'] = event
+    frame = _frame(fields)
     if 'data' in kwargs:
-        data = ',"%s":%s' % (kwargs['data']['key'], kwargs['data']['value'])
-    else:
-        data = ''
-    if action_id is None:
-        action_id = ''
-    else:
-        action_id = '"action_id":%s,' % action_id
-    msg_q_tx.put(u'{"id":%s,"timestamp":%s,"type":"event","version":1,'
-                 u'%s"level":"INFO","event":"%s"%s}\n' %
-                 (rid, int(((time.time() - start_time) * 100) + 3800), action_id, event, data))
+        frame = '%s,%s:%s}' % (frame[:-1], json.dumps(str(kwargs['data']['key'])),
+                               kwargs['data']['value'])
+    msg_q_tx.put(frame + '\n')
 
 
 def send_wss_progress(msg_q_tx: Queue, action_id: Union[int, None], progress: str,
@@ -702,17 +1053,17 @@ def send_wss_progress(msg_q_tx: Queue, action_id: Union[int, None], progress: st
         response_id += 1
         rid = response_id
 
-    frame = '{"id":%s,"timestamp":%s,"type":"progress","version":1,' % (
-        rid, int(((time.time() - start_time) * 100) + 3800))
+    fields = {'id': rid, 'timestamp': _timestamp(), 'type': 'progress', 'version': 1}
     if action_id is not None:
-        frame += '"action_id":%s,' % action_id
-    frame += '"progress":"%s","current":%d,"units":"%s"' % (progress, int(current), units)
+        fields['action_id'] = action_id
+    fields['progress'] = progress
+    fields['current'] = int(current)
+    fields['units'] = units
     if total is not None:
-        frame += ',"total":%d' % int(total)
+        fields['total'] = int(total)
     if values:
-        frame += ',"settings":{"values":%s}' % json.dumps(values, sort_keys=True,
-                                                          separators=(',', ':'))
-    msg_q_tx.put(frame + '}\n')
+        fields['settings'] = {'values': dict(sorted(values.items()))}
+    msg_q_tx.put(_frame(fields) + '\n')
 
 
 def update_header(s: Session, header: str, value: str) -> bool:
@@ -749,15 +1100,8 @@ def ws_connect(msg_q_rx: Queue, msg_q_tx: Queue, session: Session = None) -> Uni
     logger.info('CONNECTING')
     ws = WsClient(msg_q_rx, msg_q_tx, session)
     ws.start()
-    ws_ready = False
-    # Wait 15 seconds for session to establish, or error out
-    for x in range(0, 16):
-        if not ws.ready:
-            time.sleep(1)
-        else:
-            ws_ready = True
-            break
-    if ws_ready:
+    # Wait up to 16 seconds for the handshake, or error out.
+    if ws.opened.wait(16):
         logger.info('ESTABLISHED')
         return ws
     else:

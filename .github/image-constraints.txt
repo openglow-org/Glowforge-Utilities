@@ -1,0 +1,5 @@
+# The service library's dependencies at the versions the ForgeFIRM image
+# ships, for the CI leg on Python 3.12 (the image's interpreter).
+requests==2.32.4
+urllib3==2.2.2
+websocket-client==1.7.0

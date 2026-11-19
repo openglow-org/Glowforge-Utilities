@@ -33,7 +33,7 @@ MACHINE_SETTINGS = {
     # included for those that are not otherwise set (see further down).
     #
     # "ITEM": (<data type>, <report to service>, <min value>, <max value>, <default value>, <idle callable>,
-    # <run callable>, <cool_down callable>)
+    # <run callable>)
     "AAdc": MachineSetting(int, True, 0, 1023, 204),  # AirAssist
     "AAfc": MachineSetting(int, True, None, None, 536870912),  # AirAssist
     "AAid": MachineSetting(int, True, 0, 1023, 204),  # AirAssist

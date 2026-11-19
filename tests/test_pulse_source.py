@@ -34,8 +34,6 @@ def test_plain_body_header_and_payload():
     assert source.header['STfr'] == 10000
     assert source.header_len == 24
     assert _drain(source) == payload
-    assert source.exhausted
-    assert source.served == len(payload)
 
 
 def test_gzip_body_is_inflated_on_demand():
@@ -48,7 +46,6 @@ def test_gzip_body_is_inflated_on_demand():
     assert source.body_size < len(payload) // 10
     assert source.header['STfr'] == 10000
     assert _drain(source) == payload
-    assert source.exhausted
 
 
 def test_reads_do_not_inflate_the_whole_job():
@@ -61,14 +58,40 @@ def test_reads_do_not_inflate_the_whole_job():
     assert len(source._out) < 128 * 1024                # staged, not the job
 
 
+def _count_inflates(monkeypatch, inflated):
+    """Each inflate call's output size, appended to ``inflated``."""
+    from gfutilities.puls import source as source_mod
+    real = source_mod.zlib.decompressobj
+
+    class Counting:
+        def __init__(self, *a):
+            self._d = real(*a)
+
+        def __getattr__(self, name):
+            return getattr(self._d, name)
+
+        def decompress(self, data, max_length=0):
+            out = self._d.decompress(data, max_length)
+            inflated.append(len(out))
+            return out
+    monkeypatch.setattr(source_mod.zlib, 'decompressobj', Counting)
+
+
+def test_one_inflate_call_produces_at_most_1_mib(monkeypatch):
+    inflated = []
+    _count_inflates(monkeypatch, inflated)
+    want = 16 * 1024 * 1024
+    source = PulseSource(gzip.compress(_puls(bytes(want))))
+    assert len(source.read(want)) == want
+    assert max(inflated) <= 1024 * 1024
+
+
 def test_read_returns_short_at_the_end_then_empty():
     payload = b'abcdef'
     source = PulseSource(_puls(payload))
     assert source.read(4) == b'abcd'
-    assert source.exhausted is False
     assert source.read(4) == b'ef'
     assert source.read(4) == b''
-    assert source.exhausted
 
 
 def test_zero_length_read():
@@ -80,7 +103,6 @@ def test_zero_length_read():
 def test_empty_payload_is_a_valid_if_useless_job():
     source = PulseSource(_puls(b''))
     assert source.read(16) == b''
-    assert source.exhausted
 
 
 def test_header_raw_round_trips():
@@ -112,6 +134,37 @@ def test_short_body_is_refused():
         PulseSource(b'\x80GF')
 
 
+def test_a_header_of_64_kib_is_taken():
+    # 8 bytes of magic and length, then 8191 tags of 8 bytes: 65536 in all.
+    tags = (('STfr', 10000),) + (('ZZzz', 0),) * 8190
+    for body in (_puls(b'xyz', tags), gzip.compress(_puls(b'xyz', tags))):
+        try:
+            source = PulseSource(body)
+        except PulseSourceError as e:
+            raise AssertionError('a 64 KiB header was refused: %s' % e)
+        assert source.header_len + 8 == 65536
+        assert _drain(source) == b'xyz'
+
+
+def test_a_header_past_the_bound_is_refused_before_it_is_inflated(monkeypatch):
+    # A header length is the service's word: one past the bound is refused
+    # with only its first 8 bytes inflated, never the length it declares.
+    inflated = []
+    _count_inflates(monkeypatch, inflated)
+    # 65537: one byte past the 64 KiB bound.
+    body = gzip.compress(b'\x80GF1' + struct.pack('<I', 65537) + bytes(1 << 20))
+    with pytest.raises(PulseSourceError):
+        PulseSource(body)
+    assert sum(inflated) <= 8                  # the magic and the length field only
+
+
+def test_a_header_tag_that_is_not_text_is_refused():
+    fields = b'STfr' + struct.pack('<I', 10000) + b'\xff\xfeAB' + struct.pack('<I', 1)
+    with pytest.raises(Exception) as refused:
+        PulseSource(b'\x80GF1' + struct.pack('<I', 8 + len(fields)) + fields)
+    assert isinstance(refused.value, PulseSourceError)
+
+
 @pytest.mark.parametrize('chunk', [1, 7, 64, 4096, 1 << 20])
 def test_any_read_size_yields_the_same_payload(chunk):
     payload = bytes(range(256)) * 50
@@ -134,7 +187,7 @@ def test_compressed_body_knows_its_program_length_without_inflating_it():
     payload = bytes(range(256)) * 4000                  # 1 MB
     source = PulseSource(gzip.compress(_puls(payload)))
     assert source.program_size == len(payload)
-    assert source.served == 0                           # nothing read yet
+    assert len(source._out) < 128 * 1024                # nothing inflated past the header
     assert len(_drain(source)) == source.program_size
 
 

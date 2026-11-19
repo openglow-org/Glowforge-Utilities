@@ -29,9 +29,9 @@ card.
 
 ## Install
 
-```sh
-pip install gfutilities
-```
+Install from a git checkout. The `gfutilities` release on PyPI lags this
+repository and lacks interfaces the ForgeFIRM cloud client imports; the
+ForgeFIRM image builds the library from its git pin.
 
 From source, for development:
 

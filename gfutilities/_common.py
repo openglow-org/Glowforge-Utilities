@@ -18,7 +18,7 @@ class MachineSetting(NamedTuple):
     default: Union[int, str, float, None]
     idle: callable = None
     run: callable = None
-    cool_down: callable = None
+    cool_down: callable = None  # unused here; removed once the python3-gfhardware pin moves
 
 
 __all__ = [

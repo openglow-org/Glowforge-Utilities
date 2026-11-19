@@ -135,6 +135,14 @@ def test_a_cancel_still_reaches_a_running_job():
         assert m.calls == [('capture', action)]
 
 
+def test_an_action_without_a_positive_integer_id_is_refused_unanswered():
+    for bad in (0, False, '12', 1.0, None, -1):
+        for action in ('print', 'settings', 'lid_image', 'update_check'):
+            m = FakeMachine()
+            assert dispatch_action(m, _msg(action, mid=bad)) == 'refused', (action, bad)
+            assert m.calls == [], (action, bad)
+
+
 def test_what_the_factory_has_no_case_for_is_ignored():
     # focus is a name the service knows and the factory application has no
     # case for; an unknown name and a message with no type go the same way.

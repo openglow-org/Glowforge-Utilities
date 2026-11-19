@@ -23,6 +23,13 @@ SYNC_ACTIONS = ('settings', 'update_check', 'factory_reset',
                 'head_firmware_update')
 
 
+def valid_action_id(action_id) -> bool:
+    """True for an action id this machine takes: a positive JSON integer.
+    A bool, a string, a float or zero is not one; the single-action claim
+    reads an id by its value, so a falsy or look-alike id could pass it."""
+    return type(action_id) is int and action_id > 0
+
+
 def dispatch_action(machine, msg: dict, allow_print: bool = True) -> str:
     """
     Route one decoded service action to the machine.
@@ -44,6 +51,14 @@ def dispatch_action(machine, msg: dict, allow_print: bool = True) -> str:
     """
     action = msg.get('action_type', '')
     status = msg.get('status')
+
+    # Every action names itself by its id, and the claim and every reply go
+    # by it. An action without a usable one is not taken, and not answered:
+    # there is no id to answer it on.
+    if not valid_action_id(msg.get('id')):
+        logger.warning('refusing action "%s" with id %.40r: not a positive integer',
+                       action, msg.get('id'))
+        return 'refused'
 
     # The job actions come first, and deliberately without a status gate:
     # they are where a 'cancelled' means something, and the machine has to
@@ -80,4 +95,4 @@ def dispatch_action(machine, msg: dict, allow_print: bool = True) -> str:
     return 'ignored'
 
 
-__all__ = ['dispatch_action', 'PULS_ACTIONS', 'IMAGE_ACTIONS', 'SYNC_ACTIONS']
+__all__ = ['dispatch_action', 'valid_action_id', 'PULS_ACTIONS', 'IMAGE_ACTIONS', 'SYNC_ACTIONS']

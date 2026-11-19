@@ -7,8 +7,9 @@ contributor is welcome to read it too: it is the same set of rules.
 
 `gfutilities` is the factory protocol and service layer that cloud mode
 uses: authentication, the WebSocket client, action dispatch, the settings
-report, and pulse-file handling. It is published on PyPI, and it also
-carries a machine emulator that speaks the real protocol without hardware.
+report, and pulse-file handling. It installs from git (its PyPI release
+lags), and it also carries a machine emulator that speaks the real protocol
+without hardware.
 
 The protocol is documented at
 <https://docs.forgefirm.org/technical/machine/cloud-protocol/>.
@@ -30,11 +31,12 @@ pip install -e .          # for work on the emulator
   not widen what the machine reports, and keep the client's footprint the
   size the factory's is. A user of this library must stay within the
   vendor's terms of service.
-- **A debug aid must never cost a job.** The optional pulse-file and image
-  captures are non-fatal on every path: a missing directory or a full disk
-  drops the capture with a warning, and the job runs on.
-- The package reaches PyPI through a trusted publisher. Never cut a release
-  unless asked.
+- **A debug aid must never cost a job.** The optional capture of the images
+  sent to the service is non-fatal on every path: a missing directory or a
+  full disk drops the copy with a warning, and the action stands.
+- The package reaches PyPI through a trusted publisher, from a version tag
+  on `master` only, once the host tests pass. Never cut a release unless
+  asked.
 
 ## Project-wide rules
 

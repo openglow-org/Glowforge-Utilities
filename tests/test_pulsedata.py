@@ -101,6 +101,22 @@ def test_power_bytes_count_only_as_power():
         assert cnt['XTOT'] == cnt['YTOT'] == cnt['ZTOT'] == cnt['LE'] == 0
 
 
+def test_byte_values_decode_to_the_counts_the_format_defines():
+    # Literal counts, not the reference above: bit 4 is FIRE, bits 0-1 X,
+    # 2-3 Y, 5-6 Z, bit 7 a power setting.
+    moved = ('XP', 'XN', 'YP', 'YN', 'ZP', 'ZN', 'LE', 'LP')
+    for value, want in ((0x00, {}),
+                        (0x10, {'LE': 1}),
+                        (0x11, {'LE': 1, 'XP': 1}),
+                        (0x13, {'LE': 1, 'XN': 1}),
+                        (0x0c, {'YP': 1}),
+                        (0x24, {'YN': 1, 'ZN': 1}),
+                        (0x7f, {'LE': 1, 'XN': 1, 'YP': 1, 'ZP': 1}),
+                        (0x90, {'LP': 1})):
+        cnt = decode_all_steps(bytes([value]))
+        assert {k: cnt[k] for k in moved if cnt[k]} == want, hex(value)
+
+
 def test_step_direction_signs():
     # X+ and X- cancel; the end position is what the job's travel depends on.
     assert decode_all_steps(b'\x01' * 10)['XEND'] == 10

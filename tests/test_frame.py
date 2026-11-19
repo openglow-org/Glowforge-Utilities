@@ -25,12 +25,48 @@ def test_a_frame_splits_into_its_objects():
         assert split_frame(frame) == want, frame
 
 
+def test_a_line_separator_inside_a_string_does_not_split_the_object():
+    # JSON allows U+2028, U+2029 and U+0085 raw inside a string; only a
+    # newline separates the objects of a frame.
+    for ch in ('\u2028', '\u2029', '\u0085'):
+        obj = '{"action_type":"print","status":"cancelled","note":"a%sb","id":7}' % ch
+        assert split_frame(obj + '\n{"b":2}') == [obj, '{"b":2}']
+        assert json.loads(split_frame(obj)[0])['id'] == 7
+
+
+def test_a_frame_past_the_cap_is_dropped_unread():
+    c = websocket.WsClient(Queue(), Queue())
+    c._on_message(None, '{"a":1}\n' + ' ' * (1024 * 1024))     # past 1 MiB
+    assert c.msg_q_rx.empty()
+    c._on_message(None, '{"a":1}')
+    assert c.msg_q_rx.get_nowait() == '{"a":1}'
+
+
 # -- the progress frame ---------------------------------------------------
 
 def _sent(q: Queue) -> dict:
     raw = q.get_nowait()
     assert raw.endswith('\n')            # one frame per line, as the pump sends
-    return json.loads(raw)
+    try:
+        return json.loads(raw)
+    except ValueError as e:
+        raise AssertionError('the frame is not JSON: %s' % e)
+
+
+def test_an_event_frame_is_json_whatever_its_action_id(monkeypatch):
+    # The id and the event are quoted as JSON; the timestamp counts
+    # milliseconds on the monotonic clock from the process start.
+    monkeypatch.setattr(websocket.time, 'monotonic',
+                        lambda: websocket._START_MONOTONIC + 2.5)
+    q = Queue()
+    websocket.send_wss_event(q, 'a"b', 'print:"x"')
+    frame = _sent(q)
+    assert frame['action_id'] == 'a"b' and frame['event'] == 'print:"x"'
+    assert frame['timestamp'] == 2500
+    websocket.send_wss_event(q, 7, 'settings:completed',
+                             data={'key': 'settings', 'value': '{"values":{"a":1}}'})
+    frame = _sent(q)
+    assert frame['action_id'] == 7 and frame['settings'] == {'values': {'a': 1}}
 
 
 def test_progress_frame_carries_the_run_and_its_values():

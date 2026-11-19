@@ -18,6 +18,24 @@ from gfutilities.service.websocket import load_motion, img_upload, send_wss_even
 logger = logging.getLogger(LOGGER_NAME)
 
 
+class _Discard:
+    """A write target that keeps nothing: the emulator plays no program."""
+
+    @staticmethod
+    def write(data) -> int:
+        return len(data)
+
+
+def _uploaded(session, data: bytes, msg: dict) -> bool:
+    """img_upload as a yes or no: the emulator reports the upload's outcome
+    as its own event instead of failing the action."""
+    try:
+        return img_upload(session, data, msg)
+    except Exception as e:
+        logger.error('upload failed: %s' % e)
+        return False
+
+
 class Emulator(BaseMachine):
     """
     Glowforge Device Emulator
@@ -79,13 +97,14 @@ class Emulator(BaseMachine):
             data = f.read()
         send_wss_event(self._q_msg_tx, msg['id'], '%s:capture:completed' % action)
         send_wss_event(self._q_msg_tx, msg['id'], '%s:upload:starting' % action)
-        ok = img_upload(self._session, data, msg)
+        ok = _uploaded(self._session, data, msg)
         send_wss_event(self._q_msg_tx, msg['id'],
                        '%s:upload:%s' % (action, 'completed' if ok else 'failed'))
 
     def _hunt(self, msg: dict) -> None:
         self._last_action = 'hunt'
-        self._motion_download(msg)
+        if not self._motion_download(msg):
+            self._running_action_cancelled = True
 
     def _initialize(self) -> None:
         pass
@@ -106,8 +125,12 @@ class Emulator(BaseMachine):
         self._last_action = 'lid_image'
 
     def _motion(self, msg: dict) -> None:
-        # Download puls file from service
-        self._motion_download(msg)
+        # Download puls file from service. A job this machine would refuse
+        # is refused here too: canceled, as the hardware machine ends it.
+        if not self._motion_download(msg):
+            self._running_action_cancelled = True
+            self._last_action = msg['action_type']
+            return
         if msg['action_type'] == 'print':
             send_wss_event(self._q_msg_tx, msg['id'], 'print:download:completed')
             self._button_wait(msg)
@@ -121,16 +144,23 @@ class Emulator(BaseMachine):
 
         self._last_action = msg['action_type']
 
-    def _motion_download(self, msg: dict):
+    def _motion_download(self, msg: dict) -> bool:
+        """Download the job and walk it as the machine would, keeping none
+        of its program: the job's header and its statistics go to an .info
+        file in EMULATOR.MOTION_DL_DIR. A job load_motion refuses writes
+        nothing. Returns whether the job was taken."""
         logger.info('DOWNLOADING')
+        info = load_motion(self._session, msg['motion_url'], _Discard())
+        if not info:
+            logger.info('REFUSED')
+            return False
         base_file_name = '%s/%s_%s' % (get_cfg('EMULATOR.MOTION_DL_DIR'),
                                        time.strftime("%Y-%m-%d_%H%M%S"), msg['action_type'])
-        info = load_motion(self._session, msg['motion_url'], base_file_name + '.puls')
         with open(base_file_name + '.info', 'w') as f:
             f.write(json.dumps(info, sort_keys=True, indent=4, default=str) + '\n')
         logger.debug('Header: %s' % info)
         logger.info('COMPLETE')
-        return
+        return True
 
     def _shutdown(self) -> None:
         pass

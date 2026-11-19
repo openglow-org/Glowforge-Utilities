@@ -19,6 +19,21 @@ from gfutilities.service.websocket import get_session, firmware_check, ws_connec
 
 logger = logging.getLogger(LOGGER_NAME)
 
+# A session is ended (the process restarts and connects again) only for a
+# reconnect that is stuck: the socket seen not ready, with the machine idle
+# (no action holding it, no event queued or held by the transmit pump), at
+# every pass for WS_STALL_S, and the client's reconnect loop not having
+# begun a step (an attempt or a wait) for as long. An outage of any length
+# keeps the session while the loop cycles, beginning a step at least every
+# 300 s plus one sign-in and one handshake, and so does the end of a long
+# session, whose last step is as old as the session. A session ended this
+# way ends the process; its respawn's first settings report carries the
+# machine's values, and the service answers with its connect-time hunt, as
+# at any start without the no-hunt marker.
+WS_STALL_S = 900.0
+
+_monotonic = time.monotonic
+
 
 class GFUIService:
     """
@@ -33,7 +48,6 @@ class GFUIService:
         self.session = None
         self.q_msg_rx = Queue()
         self.q_msg_tx = Queue()
-        self.q_capture = Queue()
         self._machine = machine
         self._ws = None
         self.stop = False
@@ -76,6 +90,7 @@ class GFUIService:
         :return:
         """
         self._machine.start(self.session, self.q_msg_tx)
+        down_since = None
         try:
             while not self.stop:
                 # A dead WS client thread means no more frames can ever
@@ -83,6 +98,24 @@ class GFUIService:
                 # instead of blocking on an empty queue forever.
                 if self._ws is not None and not self._ws.is_alive():
                     logger.error('WS client thread died; reconnecting')
+                    break
+                # A socket down this long, with the machine idle all the
+                # while and its reconnect not moving, is a reconnect that
+                # stalled (see WS_STALL_S). A running job does not need the
+                # socket, and its events wait for the reconnect.
+                if (self._ws is None or self._ws.ready
+                        or self._machine.running_action_id is not None
+                        or self._events_waiting()):
+                    down_since = None
+                elif down_since is None:
+                    down_since = _monotonic()
+                step_at = getattr(self._ws, 'step_at', None)
+                if (down_since is not None and step_at is not None
+                        and _monotonic() - down_since > WS_STALL_S
+                        and _monotonic() - step_at > WS_STALL_S):
+                    logger.error('the service socket has not been ready, and its reconnect '
+                                 'has not moved, for %.0f s with the machine idle; ending '
+                                 'the session' % (_monotonic() - down_since))
                     break
                 try:
                     raw = self.q_msg_rx.get(timeout=0.5)
@@ -92,8 +125,10 @@ class GFUIService:
                     break
                 try:
                     msg = json.loads(raw)
-                except (ValueError, TypeError):
-                    logger.warning('unparseable service message: %r',
+                except Exception as e:
+                    # Not only ValueError: a frame nested past the decoder's
+                    # depth raises RecursionError.
+                    logger.warning('unparseable service message (%s): %r', type(e).__name__,
                                    raw[:200] if isinstance(raw, str) else raw)
                     self.q_msg_rx.task_done()
                     continue
@@ -122,6 +157,12 @@ class GFUIService:
             # files the final idle report.
             self._machine.stop()
             self._disconnect()
+
+    def _events_waiting(self) -> bool:
+        """An event is queued, or held by the transmit pump for its next
+        socket."""
+        return (not self.q_msg_tx.empty()
+                or getattr(self._ws, '_unsent', None) is not None)
 
     def _disconnect(self) -> None:
         """

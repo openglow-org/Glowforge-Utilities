@@ -16,6 +16,14 @@ from gfutilities._common import LOGGER_NAME
 # thousands of calls.
 _INPUT_CHUNK = 64 * 1024
 
+# The most one inflate call may produce, whatever the caller asked for.
+_INFLATE_MAX = 1024 * 1024
+
+# The longest header this machine reads. Every header tag the format
+# defines fits in a few KB; a length past this is refused before any of the
+# header is inflated.
+HEADER_MAX_BYTES = 65536
+
 _GZIP_MAGIC = b'\x1f\x8b'
 
 # A gzip stream ends with a four-byte uncompressed-length trailer (ISIZE)
@@ -50,7 +58,6 @@ class PulseSource:
         self.compressed = self._decomp is not None
         self._out = bytearray()
         self._eof = False
-        self._served = 0
         self.header = {}
         self.header_len = 0
         self.header_raw = b''
@@ -66,15 +73,23 @@ class PulseSource:
         total = struct.unpack_from('<I', self._out, 4)[0]
         if total < 8:
             raise PulseSourceError('puls header length %d is impossible' % total)
+        if total > HEADER_MAX_BYTES:
+            raise PulseSourceError('puls header length %d is past the %d this machine reads'
+                                   % (total, HEADER_MAX_BYTES))
         self._fill(total)
         if len(self._out) < total:
             raise PulseSourceError('puls file ended before header was complete')
-        for pos in range(8, total - 7, 8):
-            self.header[bytes(self._out[pos:pos + 4]).decode()] = \
-                struct.unpack_from('<I', self._out, pos + 4)[0]
-        self.header_len = total - 8
-        self.header_raw = bytes(self._out[:total])
+        with memoryview(self._out) as view:
+            raw = bytes(view[:total])
         del self._out[:total]
+        for pos in range(8, total - 7, 8):
+            try:
+                tag = raw[pos:pos + 4].decode()
+            except UnicodeDecodeError:
+                raise PulseSourceError('puls header tag at %d is not text' % pos)
+            self.header[tag] = struct.unpack_from('<I', raw, pos + 4)[0]
+        self.header_len = total - 8
+        self.header_raw = raw
 
     # -- how long the job is ---------------------------------------------
     def _measure_program(self) -> None:
@@ -127,8 +142,13 @@ class PulseSource:
                 self._out += self._decomp.flush()
                 self._eof = True
                 break
-            # Bounded: never inflate further ahead than the caller asked for.
-            self._out += self._decomp.decompress(src, max(want - len(self._out), 1))
+            # Bounded: never inflate further ahead than the caller asked for,
+            # and never more than _INFLATE_MAX in one call.
+            try:
+                self._out += self._decomp.decompress(
+                    src, min(max(want - len(self._out), 1), _INFLATE_MAX))
+            except zlib.error as e:
+                raise PulseSourceError('the compressed pulse data is corrupt: %s' % e)
             if self._decomp.eof:
                 self._eof = True
 
@@ -139,23 +159,7 @@ class PulseSource:
         self._fill(count)
         out = bytes(self._out[:count])
         del self._out[:count]
-        self._served += len(out)
         return out
-
-    @property
-    def exhausted(self) -> bool:
-        """True once every payload byte has been handed out."""
-        return self._eof and not self._out
-
-    @property
-    def served(self) -> int:
-        """Payload bytes handed out so far."""
-        return self._served
-
-    @property
-    def body(self) -> bytes:
-        """The body exactly as the service sent it."""
-        return bytes(self._body)
 
     @property
     def body_size(self) -> int:

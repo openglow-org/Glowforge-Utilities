@@ -66,7 +66,7 @@ def test_non_ready_status_never_starts():
     for status in ('new', 'started', 'success', 'failure'):
         m = StubMachine()
         assert m._ok_to_run_action(5, 'motion', status) is False
-        # unchanged from the idle initial (0), i.e. no action was started
+        # unchanged from the idle initial (None), i.e. no action was started
         assert not m.running_action_id
 
 
@@ -75,6 +75,51 @@ def test_cancel_of_running_sets_flag():
     m._ok_to_run_action(5, 'motion', 'ready')
     assert m._ok_to_run_action(5, 'motion', 'cancelled') is False
     assert m._running_action_cancelled is True
+
+
+def test_a_repeated_ready_of_the_running_action_does_not_cancel_it():
+    m = StubMachine()
+    m._ok_to_run_action(5, 'motion', 'ready')
+    assert m._ok_to_run_action(5, 'motion', 'ready') is False
+    assert m._running_action_cancelled is False
+    assert m.running_action_id == 5
+
+
+def test_an_id_that_is_not_a_positive_integer_claims_nothing():
+    # A falsy id would read as an idle claim: the next action would be
+    # accepted over it, and its cancel undone.
+    for bad in (0, False, True, '7', 7.0, -3, None):
+        m = StubMachine()
+        assert m._ok_to_run_action(bad, 'motion', 'ready') is False, bad
+        assert m.running_action_id is None, bad
+    m = StubMachine()
+    m._ok_to_run_action(5, 'print', 'ready')
+    assert m._ok_to_run_action(0, 'motion', 'ready') is False
+    assert m.running_action_id == 5
+
+
+def test_a_settings_report_during_a_print_keeps_the_print_cancelable():
+    m = StubMachine()
+    m._ok_to_run_action(5, 'print', 'ready')
+    m.run_settings_report({'action_type': 'settings', 'id': 6, 'status': 'ready'})
+    assert m.running_action_id == 5
+    m._ok_to_run_action(5, 'print', 'cancelled')
+    assert m._running_action_cancelled is True
+
+
+def test_an_action_whose_predecessor_will_not_exit_fails_and_frees_the_claim():
+    class Stuck:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            pass
+
+    m = StubMachine()
+    m._action_thread = Stuck()
+    m.run_puls({'action_type': 'motion', 'id': 9, 'status': 'ready'})
+    assert _events(m._q_msg_tx) == ['motion:failed']
+    assert m.running_action_id is None
 
 
 def test_cancel_of_other_action_ignored():
@@ -176,10 +221,23 @@ def test_update_check_answers_on_the_actions_own_name(monkeypatch):
     m = StubMachine()
     m._session = None
     probed = []
-    monkeypatch.setattr(basemachine, 'firmware_check', lambda s: probed.append(True))
+    monkeypatch.setattr(basemachine, 'firmware_check', lambda s: probed.append(True) or False)
     m.run_update_check({'action_type': 'update_check', 'id': 8, 'status': 'ready'})
     assert probed == [True]
     assert _events(m._q_msg_tx) == ['update_check:completed']
+
+
+def test_update_check_reports_a_probe_that_got_no_answer(monkeypatch):
+    # The probe's own request failed (no network, a refusal): the check did
+    # not happen, and the service hears so.
+    from gfutilities.service import websocket
+    from gfutilities.configuration import set_cfg
+    set_cfg('SERVICE.SERVER_URL', 'https://app.example')
+    m = StubMachine()
+    m._session = None
+    monkeypatch.setattr(websocket, 'request', lambda *a, **k: False)
+    m.run_update_check({'action_type': 'update_check', 'id': 8, 'status': 'ready'})
+    assert _events(m._q_msg_tx) == ['update_check:failed']
 
 
 def test_update_check_reports_probe_failure(monkeypatch):
@@ -194,14 +252,27 @@ def test_update_check_reports_probe_failure(monkeypatch):
     assert _events(m._q_msg_tx) == ['update_check:failed']
 
 
-def test_update_check_never_hands_off_to_an_updater():
+def test_update_check_never_hands_off_to_an_updater(monkeypatch):
     # The whole of the factory's action is starting a separate updater
     # service, which on this machine would mean installing a factory image
-    # over ForgeFIRM. Nothing in the action surface may grow a way to spawn
-    # one, so the module that answers it holds no process API at all.
-    for name in ('subprocess', 'os'):
-        assert not hasattr(basemachine, name), \
-            'basemachine imported %s; an update hand-off would start here' % name
+    # over ForgeFIRM. A check that finds a newer factory version starts no
+    # process and is answered as done.
+    import os
+    import subprocess
+    started = []
+    for mod, names in ((subprocess, ('Popen', 'run', 'call')),
+                       (os, ('system', 'fork', 'execv', 'execve', 'execvp', 'spawnv', 'posix_spawn'))):
+        for name in names:
+            if hasattr(mod, name):
+                monkeypatch.setattr(mod, name,
+                                    lambda *a, _n=name, **k: started.append(_n))
+    m = StubMachine()
+    m._session = None
+    monkeypatch.setattr(basemachine, 'firmware_check',
+                        lambda s: {'version': '9.9.9', 'download_url': 'https://x/y.fw'})
+    m.run_update_check({'action_type': 'update_check', 'id': 8, 'status': 'ready'})
+    assert started == []
+    assert _events(m._q_msg_tx) == ['update_check:completed']
 
 
 # ---- factory_reset ---------------------------------------------------------
@@ -255,3 +326,58 @@ def test_hunt_cancelled_when_handler_aborts():
     m.run_puls({'action_type': 'hunt', 'id': 8, 'status': 'ready'})
     m._action_thread.join(timeout=5)
     assert _events(m._q_msg_tx) == ['hunt:starting', 'hunt:cancelled']
+
+
+# ---- the emulator walks a job the way the machine would --------------------
+
+def test_the_emulator_cancels_a_job_the_machine_would_refuse_and_keeps_nothing(tmp_path, monkeypatch):
+    from gfutilities.configuration import set_cfg
+    from gfutilities.device import emulator as emulator_mod
+    set_cfg('EMULATOR.MOTION_DL_DIR', str(tmp_path))
+    em = emulator_mod.Emulator()
+    set_cfg('EMULATOR.ACTIVE', None)        # the emulator's own marker, for no other case
+    em._q_msg_tx = Queue()
+    monkeypatch.setattr(emulator_mod, 'load_motion', lambda s, url, out: False)
+    em.motion({'action_type': 'print', 'id': 11, 'motion_url': 'https://x/y'})
+    assert _events(em._q_msg_tx) == ['print:starting', 'print:cancelled']
+    assert list(tmp_path.iterdir()) == []
+    em._running_action_cancelled = False
+    em.hunt({'action_type': 'hunt', 'id': 12, 'motion_url': 'https://x/y'})
+    assert _events(em._q_msg_tx) == ['hunt:starting', 'hunt:cancelled']
+
+
+def test_the_emulator_keeps_a_jobs_header_and_statistics_never_its_program(tmp_path, monkeypatch):
+    import builtins
+    import struct
+    from gfutilities.configuration import set_cfg
+    from gfutilities.device import emulator as emulator_mod
+    from gfutilities.service import websocket
+    set_cfg('EMULATOR.MOTION_DL_DIR', str(tmp_path))
+    fields = b'STfr' + struct.pack('<I', 10000) + b'MCsn' + struct.pack('<I', 0) \
+        + b'PDfm' + struct.pack('<I', 0)
+    data = b'\x00GF1' + struct.pack('<I', 8 + len(fields)) + fields + b'\x01' * 4096
+
+    class Resp:
+        headers = {}
+
+        def iter_content(self, chunk_size=1):
+            yield data
+
+        def close(self):
+            pass
+    monkeypatch.setattr(websocket, 'request', lambda *a, **k: Resp())
+    written = []
+    real_open = builtins.open
+
+    def recording_open(path, mode='r', *a, **k):
+        if any(c in mode for c in 'wax+'):
+            written.append(str(path))
+        return real_open(path, mode, *a, **k)
+    monkeypatch.setattr(builtins, 'open', recording_open)
+    em = emulator_mod.Emulator()
+    set_cfg('EMULATOR.ACTIVE', None)
+    em._q_msg_tx = Queue()
+    em.motion({'action_type': 'motion', 'id': 13, 'motion_url': 'https://x/y'})
+    assert _events(em._q_msg_tx) == ['motion:starting', 'motion:completed']
+    assert len(written) == 1 and written[0].endswith('.info')
+    assert [p.suffix for p in tmp_path.iterdir()] == ['.info']

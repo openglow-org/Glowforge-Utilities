@@ -14,6 +14,7 @@ from typing import Union
 from gfutilities._common import *
 from gfutilities.configuration import set_cfg
 from gfutilities.device.settings import send_report, get_machine_setting
+from gfutilities.service.dispatch import valid_action_id
 from gfutilities.service.websocket import send_wss_event, firmware_check
 
 logger = logging.getLogger(LOGGER_NAME)
@@ -31,7 +32,8 @@ class BaseMachine:
         """
         self._action_thread: _ActionThread = _ActionThread(self, {})
         self._q_msg_tx: Union[Queue, None] = None
-        self.running_action_id: Union[int, None] = 0
+        # The single-action claim: the running action's id, None when idle.
+        self.running_action_id: Union[int, None] = None
         self.running_action_type: Union[str, None] = None
         self._running_action_cancelled: bool = False
         # Per-shot camera settings the service attaches to the current image
@@ -45,15 +47,17 @@ class BaseMachine:
     def _ok_to_run_action(self, action_id: str, msg_type: str, status: str) -> bool:
         """
         Checks the action against any current running actions.
+        An id that is not a positive integer is refused (False) whatever the
+        status.
         If this a request to cancel an action:
             - If the action is currently running, it sets the _running_action_cancelled flag as True
-            - If the action is not currently running, it sends a cancelled message to the service.
-            - For both conditions, it returns False
+            - If the action is not currently running, nothing is done.
+            - For both conditions, it returns False and sends nothing.
         If there are not any currently running actions, it sets this as the current running action and returns True.
-        If there is a current running action, and this is not a request to cancel it, sends a cancelled message
-        to the service for this requested action, and returns false.
+        If there is a current running action, and this is not a request to cancel it, it returns False and
+        sends nothing.
         :param action_id: Action ID
-        :type action_id: str
+        :type action_id: int
         :param msg_type: Action Type
         :type msg_type: str
         :param status: Status of message (either 'ready' or 'cancelled')
@@ -61,7 +65,10 @@ class BaseMachine:
         :return: Return True if this it is ok to run this action, False if not
         :rtype: bool
         """
-        action_id = int(action_id)
+        if not valid_action_id(action_id):
+            logger.warning('action id %.40r (%s) refused: not a positive integer'
+                           % (action_id, msg_type))
+            return False
         if action_id == self.running_action_id and status == 'cancelled':
             logger.debug('action %s (%s) cancellation received' % (action_id, msg_type))
             self._running_action_cancelled = True
@@ -75,7 +82,7 @@ class BaseMachine:
         if status != 'ready':
             logger.debug('ignoring status "%s" for action %s (%s)' % (status, action_id, msg_type))
             return False
-        if self.running_action_id:
+        if self.running_action_id is not None:
             return False
         logger.debug('running action set to %s (%s)' % (action_id, msg_type))
         self.running_action_id = action_id
@@ -296,17 +303,21 @@ class BaseMachine:
         all. ForgeFIRM has no such service and must never acquire one, so the
         answer is the same event without the hand-off: what is left to do is
         probe the version the service advertises, which is what the forgectrl
-        compatibility banner reads, and say the check is done.
+        compatibility banner reads, and say the check is done:
+        ':completed' when the probe answered, ':failed' when it did not (no
+        answer, or an answer that is not a version document).
         Interface for the action dispatch.
         :param msg: Incoming WSS Message
         :type msg: dict
         :return:
         """
         try:
-            firmware_check(self._session)
+            probed = firmware_check(self._session) is not None
         except Exception:
-            # The one honest failure here: the check itself did not happen.
             logger.exception('firmware version probe failed')
+            probed = False
+        if not probed:
+            # The one honest failure here: the check itself did not happen.
             send_wss_event(self._q_msg_tx, msg['id'], 'update_check:failed')
             return
         logger.info('update_check answered; ForgeFIRM never installs factory '
@@ -507,8 +518,12 @@ class _ActionThread(Thread):
         self._msg = msg
         # daemon: a blocked action (e.g. waiting on the button) must not
         # keep the process alive after the service loop exits. Safe hardware
-        # state does not depend on this thread finishing - it is enforced by
-        # _action_cleanup and, on process exit, the kernel dead man's switch.
+        # state does not depend on this thread finishing: it is enforced by
+        # _action_cleanup and the machine's own shutdown. Past the process,
+        # whoever holds the pulse device makes the machine safe (under
+        # forgectrl's broker, its reap: motion stopped, the latch locked and
+        # head/safe written; standalone, the device's final close, with its
+        # dead man's switch on a running job).
         Thread.__init__(self, daemon=True)
 
     def run(self) -> None:
