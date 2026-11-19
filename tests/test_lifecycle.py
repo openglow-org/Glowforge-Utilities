@@ -281,11 +281,40 @@ def test_gfuiservice_keeps_its_ws_client_and_shuts_it_down_with_the_machine(monk
     svc = gfuiservice.GFUIService(m)
     assert svc.connect() is True
     assert svc._ws is fake
-    svc.stop = True                 # request stop before entering the loop
+    svc.stop = True                 # a stop that landed during the sign-in
     svc.run()
-    assert m.started and m.stopped  # machine.stop() runs -> hardware safed
+    assert not m.started            # no machine start over forgectrl's stop
     assert fake.down
     assert svc._ws is None
+
+
+def test_a_machine_start_that_raises_still_stops_the_machine_and_the_session(monkeypatch):
+    from gfutilities.service import gfuiservice
+
+    class _FakeWs:
+        ready = False
+        down = False
+
+        def is_alive(self):
+            return True
+
+        def shutdown(self, timeout=10):
+            self.down = True
+            return True
+
+    class _Raising(_FakeMachine):
+        def start(self, session, q_tx):
+            raise OSError('cnc/reset')
+
+    fake = _FakeWs()
+    m = _Raising()
+    svc = gfuiservice.GFUIService(m)
+    svc._ws = fake
+    try:
+        svc.run()
+    except OSError:
+        pass
+    assert m.stopped and fake.down
 
 
 # ---- A1: what the machine will hold in memory ------------------------------

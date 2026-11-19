@@ -86,12 +86,19 @@ class GFUIService:
 
     def run(self) -> None:
         """
-        Processes messages from WSS service
+        Processes messages from WSS service. A stop requested before the
+        loop (during the sign-in) starts no machine: forgectrl has already
+        stopped and latched the hardware, and the machine's start would
+        reset and enable it. The start runs inside the try, so a start that
+        raises still stops the machine and ends the session.
         :return:
         """
-        self._machine.start(self.session, self.q_msg_tx)
+        if self.stop:
+            self._disconnect()
+            return
         down_since = None
         try:
+            self._machine.start(self.session, self.q_msg_tx)
             while not self.stop:
                 # A dead WS client thread means no more frames can ever
                 # arrive: return so the outer connect loop reconnects
