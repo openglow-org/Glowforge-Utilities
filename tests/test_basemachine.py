@@ -328,6 +328,29 @@ def test_hunt_cancelled_when_handler_aborts():
     assert _events(m._q_msg_tx) == ['hunt:starting', 'hunt:cancelled']
 
 
+def test_an_action_that_raises_fails_is_cleaned_up_and_frees_the_claim():
+    # The machine's cleanup is what stops motion and locks the laser after a
+    # print that raised: the action thread calls it, after the ':failed'
+    # event, and the next action can be claimed.
+    class CrashMachine(StubMachine):
+        def __init__(self):
+            StubMachine.__init__(self)
+            self.cleanups = []
+
+        def _motion(self, msg):
+            raise OSError(5, 'the switch read failed')
+
+        def _action_cleanup(self):
+            self.cleanups.append(_events(self._q_msg_tx))
+
+    m = CrashMachine()
+    m.run_puls({'action_type': 'print', 'id': 11, 'status': 'ready'})
+    m._action_thread.join(timeout=5)
+    assert m.cleanups == [['print:starting', 'print:failed']]
+    assert m.running_action_id is None
+    assert m._ok_to_run_action(12, 'print', 'ready') is True
+
+
 # ---- the emulator walks a job the way the machine would --------------------
 
 def test_the_emulator_cancels_a_job_the_machine_would_refuse_and_keeps_nothing(tmp_path, monkeypatch):
